@@ -1,6 +1,6 @@
 
 # Ablatix
-Ablatix is an enterprise-grade AI framework designed to automate global media compliance. Using a combination of Multimodal AI and Agentic RAG, Ablatix doesn't just find legal violations—it systematically "ablates" (fixes) them in real-time to protect creators from international fines.
+Ablatix is an enterprise-grade AI framework designed to automate global media compliance. Using a combination of Multimodal AI and Agentic RAG, Ablatix doesn't just find legal violations—it systematically "ablates" (fixes/remediates) them in real-time to protect creators and global company's marketing team from international fines and legal action.
 
 ---
 
