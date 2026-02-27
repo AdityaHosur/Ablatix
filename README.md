@@ -4,7 +4,7 @@ Ablatix is an enterprise-grade AI framework designed to automate global media co
 
 ---
 
-## Features of project
+## Features of this project
 
 **1. Multimodal AI Safety Engine**
 
