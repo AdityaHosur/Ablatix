@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pdfplumber
+python-docx
+beautifulsoup4
+requests
+pillow
+pytesseract
+tqdm
+qdrant-client
+sentence-transformers
+numpy
+faiss-cpu
+fitz
+jina
+
