@@ -7,9 +7,9 @@ from groq import Groq
 from dotenv import load_dotenv
 load_dotenv()
 
-from indexer.parser import DocumentParser
-from indexer.embedder import Embedder, Reranker
-from indexer.vector_store import VectorStore
+from rag.indexer.parser import DocumentParser
+from rag.indexer.embedder import Embedder, Reranker
+from rag.indexer.vector_store import VectorStore
 
 app = FastAPI()
 
