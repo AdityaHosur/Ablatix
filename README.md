@@ -38,3 +38,15 @@ Ablatix is an enterprise grade application which serves companies and content cr
 
 Content creators and global brands have to keep posting on social media platforms to interact with their audience.If any of the post violates the country guidlines or social media guidlines or has inappropriate content then it can lead to serious legal consequences and loss of reputation in the market.So there is a need of an autonomous system that checks if the post violates guidlines or not and if it violates,then remediates(fixes) it.Now the posts are ready to upload on social media platforms !!!
 
+---
+
+## Team Members
+
+- Aditya Hosur (1MS22CS016)
+- Atharva Manchalkar (1MS22CS037)
+- Dheer N Raijada (1MS22CS167)
+- Manvith A Rai (1MS23CS407)
+
+
+
+
