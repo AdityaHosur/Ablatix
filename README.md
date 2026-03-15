@@ -23,3 +23,18 @@ Utilizing MoviePy, Ablatix surgically "ablates" or fixes non-compliant segments 
 This feature translates technical safety into Business ROI by tracking a Brand Safety Score and estimating potential legal fines avoided. By quantifying liabilities saved based on 2026 global benchmarks, Ablatix proves its value as a mission-critical financial asset.
 
 ---
+
+## Target Users
+
+**1. Content Creators and social media influencers**
+
+**2.Marketing teams of global companies and new age brands**
+
+Ablatix is an enterprise grade application which serves companies and content creators and saves them from uploading content which might have violations and  can affect their buisness. 
+
+---
+
+## Need of this project
+
+Content creators and global brands have to keep posting on social media platforms to interact with their audience.If any of the post violates the country guidlines or social media guidlines or has inappropriate content then it can lead to serious legal consequences and loss of reputation in the market.So there is a need of an autonomous system that checks if the post violates guidlines or not and if it violates,then remediates(fixes) it.Now the posts are ready to upload on social media platforms !!!
+
