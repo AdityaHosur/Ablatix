@@ -44,39 +44,39 @@ Content creators and global brands have to keep posting on social media platform
 Our system focuses on detecting major content violations based on guidelines extracted from YouTube, Instagram, and X. The following key categories are covered:
 
 ### 1. Hate Speech & Discrimination
-- Content attacking or demeaning individuals/groups based on race, religion, gender, nationality, or identity  
-- Promotion of exclusion, superiority, or discrimination  
+- Content attacking or demeaning individuals/groups based on race, religion, gender, nationality, or identity.  
+- Promotion of exclusion, superiority, or discrimination.  
 
 ### 2. Violence & Harmful/Dangerous Content
-- Physical violence, threats, or encouragement of harm  
-- Dangerous acts, challenges, or activities that may cause injury  
+- Physical violence, threats, or encouragement of harm.  
+- Dangerous acts, challenges, or activities that may cause injury. 
 
 ### 3. Harassment, Bullying & Abuse
-- Targeted harassment, abusive language, or repeated harmful behavior toward individuals or groups  
+- Targeted harassment, abusive language, or repeated harmful behavior toward individuals or groups.  
 
 ### 4. Nudity & Sexual Content
-- Explicit sexual content or inappropriate nudity  
-- Content involving sexual exploitation or unsafe exposure  
+- Explicit sexual content or inappropriate nudity.  
+- Content involving sexual exploitation or unsafe exposure.  
 
 ### 5. Self-Harm & Suicide Content
-- Promotion, encouragement, or depiction of self-harm or suicide  
-- Harmful eating disorder-related content  
+- Promotion, encouragement, or depiction of self-harm or suicide.  
+- Harmful eating disorder-related content.  
 
 ### 6. Misinformation & Deceptive Content
-- False or misleading information that can cause real-world harm (e.g., health, elections)  
+- False or misleading information that can cause real-world harm (e.g., health, elections).  
 
 ### 7. Spam, Scams & Fraud
-- Phishing, scams, deceptive practices, or misleading content intended to exploit users  
+- Phishing, scams, deceptive practices, or misleading content intended to exploit users.  
 
 ### 8. Illegal Activities & Regulated Goods
-- Promotion or sale of illegal goods such as drugs, weapons, or restricted products  
-- Encouragement of unlawful activities  
+- Promotion or sale of illegal goods such as drugs, weapons, or restricted products.  
+- Encouragement of unlawful activities. 
 
 ### 9. Privacy Violations
-- Sharing personal or sensitive information without consent (e.g., doxxing)  
+- Sharing personal or sensitive information without consent (e.g., doxxing).
 
 ### 10. Impersonation & Fake Identity
-- Pretending to be individuals, organizations, or brands with intent to mislead  
+- Pretending to be individuals, organizations, or brands with intent to mislead.
 
 ---
 
