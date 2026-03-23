@@ -39,6 +39,51 @@ Ablatix is an enterprise grade application which serves companies and content cr
 Content creators and global brands have to keep posting on social media platforms to interact with their audience.If any of the post violates the country guidlines or social media guidlines or has inappropriate content then it can lead to serious legal consequences and loss of reputation in the market.So there is a need of an autonomous system that checks if the post violates guidlines or not and if it violates,then remediates(fixes) it.Now the posts are ready to upload on social media platforms !!!
 
 ---
+## 📌 Scope of Violation Detection
+
+Our system focuses on detecting major content violations based on guidelines extracted from YouTube, Instagram, and X. The following key categories are covered:
+
+### 1. Hate Speech & Discrimination
+- Content attacking or demeaning individuals/groups based on race, religion, gender, nationality, or identity  
+- Promotion of exclusion, superiority, or discrimination  
+
+### 2. Violence & Harmful/Dangerous Content
+- Physical violence, threats, or encouragement of harm  
+- Dangerous acts, challenges, or activities that may cause injury  
+
+### 3. Harassment, Bullying & Abuse
+- Targeted harassment, abusive language, or repeated harmful behavior toward individuals or groups  
+
+### 4. Nudity & Sexual Content
+- Explicit sexual content or inappropriate nudity  
+- Content involving sexual exploitation or unsafe exposure  
+
+### 5. Self-Harm & Suicide Content
+- Promotion, encouragement, or depiction of self-harm or suicide  
+- Harmful eating disorder-related content  
+
+### 6. Misinformation & Deceptive Content
+- False or misleading information that can cause real-world harm (e.g., health, elections)  
+
+### 7. Spam, Scams & Fraud
+- Phishing, scams, deceptive practices, or misleading content intended to exploit users  
+
+### 8. Illegal Activities & Regulated Goods
+- Promotion or sale of illegal goods such as drugs, weapons, or restricted products  
+- Encouragement of unlawful activities  
+
+### 9. Privacy Violations
+- Sharing personal or sensitive information without consent (e.g., doxxing)  
+
+### 10. Impersonation & Fake Identity
+- Pretending to be individuals, organizations, or brands with intent to mislead  
+
+---
+
+## 🧠 Note
+These categories are derived from real-world platform policies and represent the most critical and commonly enforced content violations across major social media platforms. The system focuses on high-impact violations to enable effective and scalable detection.
+
+---
 
 ## Team Members
 
