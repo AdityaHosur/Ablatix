@@ -2,31 +2,27 @@ import os
 import tempfile
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from groq import Groq
 from dotenv import load_dotenv
 load_dotenv()
 
-from rag.indexer.parser import DocumentParser
-from rag.indexer.embedder import Embedder, Reranker
-from rag.indexer.vector_store import VectorStore
+from rag.indexer.page_index import PageIndexService
+from rag.indexer.vrag import run_reasoning_rag
+from scraper.scraper import scrape_all_platforms
+from scraper.document_builder import build_per_platform_pdfs
 
 app = FastAPI()
 
 # ─────────────────────────────────────────────
 # Initialize components
 # ─────────────────────────────────────────────
-print("Loading parser...")
-parser = DocumentParser(parser_type="llama", chunk_size=500, chunk_overlap=100)
-
-print("Loading embedder...")
-embedder = Embedder(model_name="BAAI/bge-m3")
-
-print("Loading vector store...")
-vector_store = VectorStore(collection_name="ablatix_index", vector_size=1024)
-
-print("Loading reranker...")
-reranker = Reranker()
+print("Loading PageIndex service...")
+try:
+    page_index_service = PageIndexService(api_key=os.environ.get("PAGEINDEX_API_KEY"))
+except ImportError as e:
+    print(f"⚠️  PageIndex not available: {e}. Endpoints requiring PageIndex will return 503.")
+    page_index_service = None
 
 print("Loading LLM (Groq)...")
 # Get free API key from https://console.groq.com/
@@ -36,51 +32,31 @@ print("All components loaded!")
 
 
 # ─────────────────────────────────────────────
-# Helper: Build prompt from query + chunks
-# ─────────────────────────────────────────────
-def build_prompt(query: str, chunks: List[str]) -> str:
-    context = "\n\n".join([f"[Chunk {i+1}]:\n{chunk}" for i, chunk in enumerate(chunks)])
-    return f"""You are a helpful AI assistant. Use the context below to answer the question.
-If the answer is not in the context, say "I don't have enough information to answer this question."
-
-Context:
-{context}
-
-Question: {query}
-Answer:"""
-
-
-# ─────────────────────────────────────────────
-# Helper: Generate answer from Groq LLM
-# ─────────────────────────────────────────────
-def generate_answer(query: str, chunks: List[str]) -> str:
-    prompt = build_prompt(query, chunks)
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant that answers questions based on provided context."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        max_tokens=512,
-        temperature=0.1
-    )
-    return response.choices[0].message.content.strip()
-
-
-# ─────────────────────────────────────────────
 # Request Models
 # ─────────────────────────────────────────────
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 10
-    alpha: float = 0.5
-    top_n_for_llm: int = 3
+    doc_id: Optional[str] = None
+    top_n_for_llm: int = Field(default=3, ge=1, le=10)
+
+
+class PlatformArtifactResponse(BaseModel):
+    """Response for a single platform ingestion."""
+    platform: str
+    doc_id: Optional[str] = None
+    filename: Optional[str] = None
+    filepath: Optional[str] = None
+    ready: bool = False
+    scraped_count: int = 0
+    failed_urls: List[Dict[str, str]] = []
+    error: Optional[str] = None
+
+
+class ScraperUploadResponse(BaseModel):
+    """Response from scrape-and-upload endpoint."""
+    status: str  # "completed", "partial", "failed"
+    message: str
+    platforms: Dict[str, PlatformArtifactResponse]
 
 
 # ─────────────────────────────────────────────
@@ -89,87 +65,158 @@ class QueryRequest(BaseModel):
 @app.post("/upload/")
 async def upload_document(
     file: UploadFile = File(...),
-    parser_type: str = Form("llama")
+    parser_type: str = Form("pageindex")
 ):
+    if parser_type.lower() != "pageindex":
+        raise HTTPException(status_code=400, detail="Only parser_type='pageindex' is supported.")
+
+    if not page_index_service:
+        raise HTTPException(status_code=503, detail="PageIndex service is not configured.")
+
     suffix = os.path.splitext(file.filename)[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
     try:
-        doc_parser = DocumentParser(
-            parser_type=parser_type,
-            chunk_size=500,
-            chunk_overlap=100
-        )
-        parsed_chunks = doc_parser.parse(tmp_path)
+        submit_result = page_index_service.submit_document(tmp_path, filename=file.filename)
         os.remove(tmp_path)
-
-        texts = [chunk["text"] for chunk in parsed_chunks if chunk.get("text")]
-        embeddings = embedder.embed_text(texts)
-        payloads = [
-            {
-                "text": chunk["text"],
-                "metadata": chunk.get("metadata", {}),
-                "type": chunk.get("type", "paragraph")
-            }
-            for chunk in parsed_chunks if chunk.get("text")
-        ]
-        vector_store.upsert(embeddings, payloads)
     except Exception as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise HTTPException(status_code=400, detail=f"Indexing failed: {str(e)}")
 
-    return {"status": "indexed", "chunks_indexed": len(texts)}
+    return {
+        "status": "submitted",
+        "doc_id": submit_result["doc_id"],
+        "ready": submit_result.get("ready", False),
+        "filename": file.filename,
+    }
 
 
 @app.post("/query/")
-async def query_endpoint(
-    query: str,
-    top_k: int = 10,
-    alpha: float = 0.5,
-    top_n_for_llm: int = 3
-):
+async def query_endpoint(request: QueryRequest):
     try:
-        # Step 1: Embed query
-        query_vector = embedder.embed_text(query)[0]
+        if not page_index_service:
+            raise HTTPException(status_code=503, detail="PageIndex service is not configured.")
 
-        # Step 2: Hybrid search
-        results = vector_store.hybrid_search(
-            query_vector,
-            query,
-            top_k=top_k,
-            alpha=alpha
+        doc_id = request.doc_id or page_index_service.get_latest_doc_id()
+        if not doc_id:
+            raise HTTPException(status_code=400, detail="No document found. Upload a document first.")
+
+        tree = page_index_service.get_tree(doc_id, node_summary=True, wait_ready=True)
+        rag_result = run_reasoning_rag(
+            query=request.query,
+            tree=tree,
+            groq_client=groq_client,
+            model=GROQ_MODEL,
+            top_n=request.top_n_for_llm,
         )
-
-        # Step 3: Rerank
-        docs = [r["payload"].get("text", "") for r in results]
-        scores = reranker.rerank(query, docs)
-
-        # Step 4: Sort by rerank score
-        for r, s in zip(results, scores):
-            r["rerank_score"] = float(s)
-        results = sorted(results, key=lambda x: x["rerank_score"], reverse=True)
-
-        # Step 5: Select top N chunks for LLM
-        top_chunks = [
-            r["payload"].get("text", "")
-            for r in results[:top_n_for_llm]
-        ]
-
-        # Step 6: Generate answer using Groq LLM
-        answer = generate_answer(query, top_chunks)
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Query failed: {str(e)}")
 
     return {
-        "query": query,
-        "answer": answer,
-        "sources": results[:top_n_for_llm],
-        "all_results": results
+        "query": request.query,
+        "doc_id": doc_id,
+        "answer": rag_result["answer"],
+        "sources": rag_result["sources"],
+        "reasoning": rag_result["reasoning"],
     }
+
+
+@app.post("/scrape-and-upload/")
+async def scrape_and_upload():
+    """
+    Scrape all platforms from sources.json, build per-platform PDFs,
+    and submit each to PageIndex. Returns per-platform doc_ids and metadata.
+    """
+    if not page_index_service:
+        raise HTTPException(status_code=503, detail="PageIndex service is not configured.")
+
+    try:
+        print("📡 Starting scraper pipeline...")
+        
+        # Step 1: Scrape all platforms
+        print("  Step 1: Scraping sources...")
+        scraped_content = scrape_all_platforms()
+        
+        # Step 2: Build per-platform PDFs
+        print("  Step 2: Building PDFs...")
+        pdf_artifacts = build_per_platform_pdfs(scraped_content)
+        
+        # Step 3: Submit each PDF to PageIndex
+        print("  Step 3: Submitting to PageIndex...")
+        platforms_data = {}
+        failed_platforms = []
+        
+        for platform, artifact in pdf_artifacts.items():
+            if "error" in artifact:
+                platforms_data[platform] = PlatformArtifactResponse(
+                    platform=platform,
+                    error=artifact["error"],
+                )
+                failed_platforms.append(platform)
+                continue
+            
+            try:
+                # Only submit if PDF was generated successfully
+                if artifact.get("filepath") and os.path.exists(artifact["filepath"]):
+                    submit_result = page_index_service.submit_and_track_scraper_artifact(
+                        file_path=artifact["filepath"],
+                        platform=platform,
+                        artifact_metadata=artifact,
+                    )
+                    
+                    platforms_data[platform] = PlatformArtifactResponse(
+                        platform=platform,
+                        doc_id=submit_result["doc_id"],
+                        filename=artifact.get("filename"),
+                        filepath=artifact.get("filepath"),
+                        ready=submit_result.get("ready", False),
+                        scraped_count=artifact.get("scraped_count", 0),
+                        failed_urls=artifact.get("failed_urls", []),
+                    )
+                else:
+                    platforms_data[platform] = PlatformArtifactResponse(
+                        platform=platform,
+                        error="PDF generation failed (file not found)",
+                    )
+                    failed_platforms.append(platform)
+                    
+            except Exception as e:
+                platforms_data[platform] = PlatformArtifactResponse(
+                    platform=platform,
+                    error=f"PageIndex submission failed: {str(e)}",
+                )
+                failed_platforms.append(platform)
+        
+        # Determine overall status
+        successful_platforms = [p for p in platforms_data if platforms_data[p].doc_id]
+        
+        if len(successful_platforms) == len(scraped_content):
+            status = "completed"
+            message = f"Successfully processed {len(successful_platforms)} platforms"
+        elif len(successful_platforms) > 0:
+            status = "partial"
+            message = f"Processed {len(successful_platforms)} platforms; {len(failed_platforms)} failed"
+        else:
+            status = "failed"
+            message = "All platforms failed to process"
+        
+        print(f"✅ Scraper pipeline complete: {status}")
+        
+        return ScraperUploadResponse(
+            status=status,
+            message=message,
+            platforms=platforms_data,
+        )
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Scraper pipeline failed: {str(e)}",
+        )
 
 
 @app.post("/hybrid_search/")
@@ -178,22 +225,10 @@ async def hybrid_search(
     top_k: int = 10,
     alpha: float = 0.5
 ):
-    try:
-        query_vector = embedder.embed_text(query)[0]
-        results = vector_store.hybrid_search(
-            query_vector,
-            query,
-            top_k=top_k,
-            alpha=alpha
-        )
-        docs = [r["payload"].get("text", "") for r in results]
-        scores = reranker.rerank(query, docs)
-        for r, s in zip(results, scores):
-            r["rerank_score"] = float(s)
-        results = sorted(results, key=lambda x: x["rerank_score"], reverse=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Hybrid search failed: {str(e)}")
-    return {"results": results}
+    raise HTTPException(
+        status_code=410,
+        detail="/hybrid_search is deprecated. Use /query with PageIndex-backed retrieval.",
+    )
 
 
 @app.post("/search/")
@@ -201,20 +236,18 @@ async def search_vectors(
     query_vector: List[float],
     top_k: int = 10
 ):
-    try:
-        results = vector_store.search(query_vector, top_k=top_k)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Search failed: {str(e)}")
-    return {"results": results}
+    raise HTTPException(
+        status_code=410,
+        detail="/search is deprecated in vectorless mode.",
+    )
 
 
 @app.post("/embed/")
 async def embed_texts(texts: List[str]):
-    try:
-        embeddings = embedder.embed_text(texts)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Embedding failed: {str(e)}")
-    return {"embeddings": embeddings}
+    raise HTTPException(
+        status_code=410,
+        detail="/embed is deprecated in vectorless mode.",
+    )
 
 
 @app.post("/upsert/")
@@ -222,8 +255,7 @@ async def upsert_vectors(
     embeddings: List[List[float]],
     payloads: Optional[List[Dict[str, Any]]] = None
 ):
-    try:
-        vector_store.upsert(embeddings, payloads)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Upsert failed: {str(e)}")
-    return {"status": "upserted", "count": len(embeddings)}
+    raise HTTPException(
+        status_code=410,
+        detail="/upsert is deprecated in vectorless mode.",
+    )

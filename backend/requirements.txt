@@ -1,6 +1,11 @@
 fastapi
 uvicorn[standard]
 python-multipart
+groq
+pageindex
+reportlab
+selenium
+webdriver-manager
 pdfplumber
 python-docx
 beautifulsoup4
@@ -14,4 +19,3 @@ numpy
 faiss-cpu
 fitz
 jina
-
