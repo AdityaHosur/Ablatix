@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
-groq
+ollama
 pageindex
 reportlab
 selenium
@@ -19,3 +19,5 @@ numpy
 faiss-cpu
 fitz
 jina
+python-dotenv
+google-genai

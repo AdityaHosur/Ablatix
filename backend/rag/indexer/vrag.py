@@ -1,5 +1,16 @@
 import json
+import os
 from typing import Any, Dict, List
+
+from dotenv import load_dotenv
+from ollama import Client
+
+load_dotenv()
+
+_ollama_client = Client(
+    host="https://ollama.com",
+    headers={"Authorization": f"Bearer {os.environ.get('OLLAMA_API_KEY', '')}"},
+)
 
 
 def _extract_json(content: str) -> Dict[str, Any]:
@@ -25,24 +36,32 @@ def _extract_json(content: str) -> Dict[str, Any]:
         return {}
 
 
-def _call_groq(
-    groq_client,
+def _call_llm(
     model: str,
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.1,
     max_tokens: int = 700,
 ) -> str:
-    response = groq_client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    return (response.choices[0].message.content or "").strip()
+    """Call Ollama Cloud chat completion API.
+
+    groq_client parameter is no longer used; we rely on a global Ollama client.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # The official ollama Python client ignores max_tokens for now but we keep
+    # the argument for API compatibility and future control.
+    response = _ollama_client.chat(model=model, messages=messages)
+
+    # Newer versions return an object with .message; older may be dict.
+    if hasattr(response, "message"):
+        content = getattr(response.message, "content", "")
+    else:
+        content = response.get("message", {}).get("content", "")
+    return (content or "").strip()
 
 
 def _remove_fields(data: Any, fields: List[str]) -> Any:
@@ -118,8 +137,7 @@ Return strict JSON only:
 }}
 """
 
-    search_raw = _call_groq(
-        groq_client=groq_client,
+    search_raw = _call_llm(
         model=model,
         system_prompt="You perform retrieval planning and return strict JSON.",
         user_prompt=search_prompt,
@@ -159,8 +177,7 @@ Context:
 {'\n\n'.join(context_parts)}
 """
 
-    answer = _call_groq(
-        groq_client=groq_client,
+    answer = _call_llm(
         model=model,
         system_prompt="You are a precise compliance assistant grounded in provided context.",
         user_prompt=answer_prompt,

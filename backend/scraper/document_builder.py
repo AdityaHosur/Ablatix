@@ -33,7 +33,7 @@ def build_per_platform_pdfs(
         Dict mapping platform name to artifact metadata (path, filename, stats)
     """
     if output_dir is None:
-        output_dir = str(Path(__file__).parent.parent / "data" / "guidelines")
+        output_dir = str(Path(__file__).parent.parent / "data" / "guidelines" / "media")
     
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
