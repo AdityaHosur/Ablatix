@@ -51,3 +51,4 @@ dist/
 build/
 users.dbnode_modules/
 .next/
+frontend/users.db
