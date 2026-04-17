@@ -1,7 +1,9 @@
 import os
 import json
 import tempfile
+import uuid
 from pathlib import Path
+from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
@@ -23,6 +25,8 @@ from media_jobs import (
     extract_audio_wav,
     transcribe_audio_segments,
     synthesize_media_description,
+    _parse_vision_analysis,
+    frame_bytes_to_data_url,
 )
 
 app = FastAPI()
@@ -36,6 +40,8 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).parent
+RESULTS_DIR = BASE_DIR / "data" / "violation_results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────
 # Initialize components
@@ -138,6 +144,7 @@ class ViolationDocResult(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
     reasoning: str
+    violations: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ViolationQueryRequest(BaseModel):
@@ -149,6 +156,18 @@ class ViolationQueryRequest(BaseModel):
 class ViolationQueryResponse(BaseModel):
     description: str
     results: List[ViolationDocResult]
+    storage_path: Optional[str] = None
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _persist_violation_result(prefix: str, payload: Dict[str, Any]) -> str:
+    filename = f"{prefix}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}.json"
+    path = RESULTS_DIR / filename
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(path)
 
 
 class MediaJobCreateResponse(BaseModel):
@@ -230,6 +249,7 @@ async def query_endpoint(request: QueryRequest):
         "answer": rag_result["answer"],
         "sources": rag_result["sources"],
         "reasoning": rag_result["reasoning"],
+        "storage_path": rag_result.storage_path,
     }
 
 
@@ -481,9 +501,9 @@ def _run_violation_query(
             - Use simple, direct language. Avoid legal jargon and quote-heavy answers.
             - Identify all clearly relevant rules, sections, clauses, or articles in this document that the media may violate.
             - For each potential violation, list:
-                - The exact reference (for example, article/section number and title) as written in the document.
+                - The exact reference, using the PageIndex tree node title, rule number, clause, or article if available.
                 - A short, human-friendly explanation of how the media conflicts with that reference.
-                - A short quote or very close paraphrase from the document text as proof.
+                - A concise action-oriented remediation such as trim, blur, crop, remove, or mute when appropriate.
             - If the document does not clearly cover this situation, say clearly that you cannot identify any specific violations in this document.
 
             Present your answer as a concise, numbered list of violations (or a clear statement that no violations can be determined).
@@ -495,7 +515,10 @@ def _run_violation_query(
                 groq_client=groq_client,
                 model=GROQ_MODEL,
                 top_n=top_n_for_llm,
+                structured=True,
             )
+
+            violations = rag_result.get("answer_structured", [])
 
             results.append(
                 ViolationDocResult(
@@ -504,6 +527,7 @@ def _run_violation_query(
                     answer=rag_result["answer"],
                     sources=rag_result.get("sources", []),
                     reasoning=rag_result.get("reasoning", ""),
+                    violations=violations,
                 )
             )
 
@@ -517,10 +541,24 @@ def _run_violation_query(
                     answer=error_msg,
                     sources=[],
                     reasoning="",
+                    violations=[],
                 )
             )
 
-    return ViolationQueryResponse(description=description, results=results)
+    response = ViolationQueryResponse(description=description, results=results)
+    storage_path = _persist_violation_result(
+        "text",
+        {
+            "kind": "text",
+            "created_at": _utc_now_iso(),
+            "description": description,
+            "docs": [doc.model_dump() for doc in docs],
+            "top_n_for_llm": top_n_for_llm,
+            "results": [result.model_dump() for result in results],
+        },
+    )
+    response.storage_path = storage_path
+    return response
 
 def _save_doc_id_sidecar(pdf_path: Path, doc_id: str) -> None:
     """Save doc_id to a sidecar text file next to the PDF.
@@ -779,11 +817,25 @@ def _process_media_job(
                 model=GROQ_MODEL,
                 api_key=ollama_api_key,
                 prompt=(
-                    "Describe this image for policy and safety compliance review. "
-                    "Mention potentially unsafe, illegal, sexual, violent, hateful, or misleading elements if present."
+                    "Analyze this image for policy and safety compliance violations.\n\n"
+                    "Return ONLY valid JSON:\n"
+                    "{\n"
+                    '  "violations": [\n'
+                    "    {\n"
+                    '      "type": "violation category",\n'
+                    '      "confidence": 0.95,\n'
+                    '      "regions": [{"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4}]\n'
+                    "    }\n"
+                    "  ],\n"
+                    '  "description": "summary"\n'
+                    "}\n\n"
+                    "Coordinates are normalized 0-1 (top-left=0,0, bottom-right=1,1).\n"
+                    "Include regions for each violation found.\n"
+                    "If no violations, return empty violations array."
                 ),
             )
-            frame_analyses.append({"timestamp": 0.0, "description": desc})
+            analyzed = _parse_vision_analysis(desc)
+            frame_analyses.append({"timestamp": 0.0, "violations": analyzed.get("violations", []), "description": analyzed.get("description", "")})
             update_media_job(job_id, progress=45, stage="image-analysis")
         else:
             frames = extract_video_sample_frames(media_path, max_frames=6)
@@ -795,11 +847,30 @@ def _process_media_job(
                     model=GROQ_MODEL,
                     api_key=ollama_api_key,
                     prompt=(
-                        "Describe this video frame for policy and safety compliance review. "
-                        "Mention potentially unsafe, illegal, sexual, violent, hateful, or misleading elements if present."
+                        "Analyze this video frame for policy and safety compliance violations.\n\n"
+                        "Return ONLY valid JSON:\n"
+                        "{\n"
+                        '  "violations": [\n'
+                        "    {\n"
+                        '      "type": "violation category",\n'
+                        '      "confidence": 0.95,\n'
+                        '      "regions": [{"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4}]\n'
+                        "    }\n"
+                        "  ],\n"
+                        '  "description": "summary"\n'
+                        "}\n\n"
+                        "Coordinates are normalized 0-1 (top-left=0,0, bottom-right=1,1).\n"
+                        "Include regions for each violation found.\n"
+                        "If no violations, return empty violations array."
                     ),
                 )
-                frame_analyses.append({"timestamp": round(ts, 2), "description": desc})
+                analyzed = _parse_vision_analysis(desc)
+                frame_analyses.append({
+                    "timestamp": round(ts, 2),
+                    "frame_preview": frame_bytes_to_data_url(frame_bytes),
+                    "violations": analyzed.get("violations", []),
+                    "description": analyzed.get("description", ""),
+                })
 
             update_media_job(job_id, progress=55, stage="frame-captioning")
 
@@ -835,23 +906,43 @@ def _process_media_job(
             top_n_for_llm=top_n_for_llm,
         )
 
+        result_payload = {
+            "kind": "media",
+            "created_at": _utc_now_iso(),
+            "media_type": media_type,
+            "description": synthesized_description,
+            "frame_analyses": frame_analyses,
+            "audio_transcription": transcript_segments,
+            "selected_docs": [doc.model_dump() for doc in docs],
+            "results": [r.model_dump() for r in violations.results],
+        }
+        storage_path = _persist_violation_result("media", result_payload)
+        result_payload["storage_path"] = storage_path
+
         update_media_job(
             job_id,
             status="completed",
             stage="completed",
             progress=100,
-            result={
-                "media_type": media_type,
-                "description": synthesized_description,
-                "frame_analyses": frame_analyses,
-                "audio_transcription": transcript_segments,
-                "results": [r.model_dump() for r in violations.results],
-            },
+            result=result_payload,
         )
 
     except Exception as e:
         append_media_job_error(job_id, stage="fatal", message=str(e), recoverable=False)
-        update_media_job(job_id, status="failed", stage="failed", progress=100)
+        failure_payload = {
+            "kind": "media",
+            "created_at": _utc_now_iso(),
+            "job_id": job_id,
+            "media_type": media_type,
+            "description": user_description,
+            "selected_docs": [doc.model_dump() for doc in docs],
+            "frame_analyses": frame_analyses,
+            "audio_transcription": transcript_segments,
+            "error": str(e),
+        }
+        failure_storage_path = _persist_violation_result("media_failed", failure_payload)
+        failure_payload["storage_path"] = failure_storage_path
+        update_media_job(job_id, status="failed", stage="failed", progress=100, result=failure_payload)
     finally:
         if os.path.exists(media_path):
             os.remove(media_path)

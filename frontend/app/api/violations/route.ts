@@ -36,6 +36,7 @@ interface ViolationDocResult {
   answer: string;
   sources: any[];
   reasoning: string;
+  violations?: any[];
 }
 
 interface ViolationsBackendResponse {

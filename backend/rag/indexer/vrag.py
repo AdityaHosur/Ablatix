@@ -13,7 +13,7 @@ _ollama_client = Client(
 )
 
 
-def _extract_json(content: str) -> Dict[str, Any]:
+def _extract_json(content: str) -> Any:
     if not content:
         return {}
 
@@ -100,8 +100,10 @@ def _build_source(node: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "node_id": node.get("node_id"),
         "title": node.get("title", "Untitled"),
+        "page_index": node.get("page_index"),
         "start_index": node.get("start_index"),
         "end_index": node.get("end_index"),
+        "summary": node.get("summary"),
     }
 
 
@@ -111,6 +113,7 @@ def run_reasoning_rag(
     groq_client,
     model: str,
     top_n: int = 3,
+    structured: bool = False,
 ) -> Dict[str, Any]:
     if not query.strip():
         raise ValueError("Query cannot be empty.")
@@ -185,8 +188,46 @@ Context:
         max_tokens=900,
     )
 
-    return {
+    answer_structured: List[Dict[str, Any]] = []
+    if structured:
+        structured_prompt = f"""
+Based on your previous analysis of the compliance question, extract all violations and remediation points as strict JSON format.
+
+Original question: {query}
+Your analysis: {answer}
+
+Return ONLY valid JSON array with no other text:
+[
+  {{"ref": "specific clause/section number or guideline name", "explanation": "concise description of how/where violation occurs", "remediation": "one-word fix"}},
+  ...
+]
+
+If no violations, return an empty array: []
+"""
+        structured_raw = _call_llm(
+            model=model,
+            system_prompt="Extract compliance violations as structured JSON array. Return only valid JSON, no markdown, no explanation.",
+            user_prompt=structured_prompt,
+            temperature=0.1,
+            max_tokens=800,
+        )
+        structured_data = _extract_json(structured_raw)
+        if isinstance(structured_data, list):
+            answer_structured = structured_data
+        elif isinstance(structured_data, dict):
+            for key in ("violations", "results", "items"):
+                value = structured_data.get(key)
+                if isinstance(value, list):
+                    answer_structured = value
+                    break
+
+    result = {
         "answer": answer,
         "sources": sources,
         "reasoning": search_json.get("thinking", ""),
     }
+
+    if structured:
+        result["answer_structured"] = answer_structured
+
+    return result

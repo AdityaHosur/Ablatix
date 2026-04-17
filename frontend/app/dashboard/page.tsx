@@ -14,6 +14,70 @@ const PLATFORMS = [
 
 const COUNTRIES = ["India", "USA", "UAE", "UK", "Singapore"];
 
+type PlatformOption = {
+  id: string;
+  name: string;
+  icon: React.ReactNode;
+};
+
+type CountryOption = string;
+
+function prettifyLabel(value: string) {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function platformIcon(platformId: string) {
+  const key = platformId.toLowerCase();
+  if (key === "youtube") return <Youtube className="w-5 h-5 text-red-500" />;
+  if (key === "instagram") return <Instagram className="w-5 h-5 text-pink-500" />;
+  if (key === "twitter" || key === "x") return <Twitter className="w-5 h-5 text-slate-900" />;
+  return <ShieldCheck className="w-5 h-5 text-slate-400" />;
+}
+
+function platformLabel(platformId: string) {
+  const key = platformId.toLowerCase();
+  if (key === "youtube") return "YouTube";
+  if (key === "instagram") return "Instagram";
+  if (key === "twitter" || key === "x") return "X / Twitter";
+  return prettifyLabel(platformId);
+}
+
+function inferPlatformId(item: { platform?: string | null; filename: string }) {
+  if (item.platform) return item.platform.toLowerCase();
+  const base = item.filename.replace(/\.pdf$/i, "");
+  if (base.includes("_guidelines_")) {
+    return base.split("_guidelines_", 1)[0].toLowerCase();
+  }
+  return base.toLowerCase();
+}
+
+function inferCountryName(filename: string) {
+  const base = filename.replace(/\.pdf$/i, "").trim();
+  const compact = base.replace(/[_\s-]+/g, "");
+
+  if (compact.length > 0 && compact.length <= 4 && /^[a-zA-Z]+$/.test(compact)) {
+    return compact.toUpperCase();
+  }
+
+  return prettifyLabel(base);
+}
+
+function renderViolationBoxes(violations: any[]) {
+  if (!Array.isArray(violations) || violations.length === 0) return null;
+
+  return violations.flatMap((violation: any, violationIndex: number) => {
+    const regions = Array.isArray(violation?.regions) ? violation.regions : [];
+    return regions.map((region: any, regionIndex: number) => ({
+      key: `${violationIndex}-${regionIndex}`,
+      region,
+    }));
+  });
+}
+
 export default function ComplianceDashboard() {
   const [mounted, setMounted] = useState(false);
 
@@ -41,11 +105,15 @@ const [progress, setProgress] = useState(0);
 const [analysisLoading, setAnalysisLoading] = useState(false);
 const [analysisError, setAnalysisError] = useState<string | null>(null);
 const [analysisResults, setAnalysisResults] = useState<any[] | null>(null);
+const [mediaAnalysisResult, setMediaAnalysisResult] = useState<any | null>(null);
 const [mediaJobId, setMediaJobId] = useState<string | null>(null);
 const [mediaJobStage, setMediaJobStage] = useState<string>("");
 const [mediaJobProgress, setMediaJobProgress] = useState<number>(0);
 
-const fileInputRef = useRef<HTMLInputElement>(null);
+const [availableDocIds, setAvailableDocIds] = useState<any>({});
+const [isLoadingDocIds, setIsLoadingDocIds] = useState(true);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
 useEffect(() => {
 return () => { if (previewUrl) URL.revokeObjectURL(previewUrl); };
@@ -73,6 +141,7 @@ setPreviewUrl(url);
 setIsRemediated(false);
 setShowResults(false);
 setProgress(0);
+setMediaAnalysisResult(null);
 
 
 };
@@ -100,12 +169,64 @@ useEffect(() => {
   if (u) setUser(JSON.parse(u));
 }, []);
 
+useEffect(() => {
+  // Fetch available doc-ids on mount
+  const fetchDocIds = async () => {
+    try {
+      const res = await fetch("/api/doc-ids");
+      if (res.ok) {
+        const data = await res.json();
+        setAvailableDocIds(data);
+      }
+    } catch (error) {
+      console.error("Failed to fetch available doc-ids:", error);
+    } finally {
+      setIsLoadingDocIds(false);
+    }
+  };
+  
+  fetchDocIds();
+}, []);
+
 const getInitials = (name: string) => {
   return name
     ?.split(" ")
     .map(word => word[0])
     .join("")
     .toUpperCase();
+};
+
+const platformOptions: PlatformOption[] = (() => {
+  const media = Array.isArray(availableDocIds?.media) ? availableDocIds.media : [];
+  if (isLoadingDocIds || media.length === 0) return PLATFORMS;
+
+  const seen = new Set<string>();
+  const options: PlatformOption[] = [];
+
+  for (const item of media) {
+    const platformId = inferPlatformId(item);
+    if (!platformId || seen.has(platformId)) continue;
+    seen.add(platformId);
+    options.push({
+      id: platformId,
+      name: platformLabel(platformId),
+      icon: platformIcon(platformId),
+    });
+  }
+
+  return options.length > 0 ? options : PLATFORMS;
+})();
+
+const countryOptions: CountryOption[] = (() => {
+  const countries = Array.isArray(availableDocIds?.country) ? availableDocIds.country : [];
+  if (isLoadingDocIds || countries.length === 0) return COUNTRIES;
+
+  const options = countries.map((item: any) => inferCountryName(item.filename));
+  return options.length > 0 ? options : COUNTRIES;
+})();
+
+const getMediaFrameAnalyses = () => {
+  return Array.isArray(mediaAnalysisResult?.frame_analyses) ? mediaAnalysisResult.frame_analyses : [];
 };
 
 const runTextAnalysis = async () => {
@@ -116,6 +237,7 @@ const runTextAnalysis = async () => {
   setAnalysisLoading(true);
   setAnalysisError(null);
   setAnalysisResults(null);
+  setMediaAnalysisResult(null);
 
   try {
     const res = await fetch("/api/violations", {
@@ -160,6 +282,7 @@ const runMediaAnalysis = async () => {
   setAnalysisLoading(true);
   setAnalysisError(null);
   setAnalysisResults(null);
+  setMediaAnalysisResult(null);
   setMediaJobId(null);
   setMediaJobStage("queued");
   setMediaJobProgress(0);
@@ -222,6 +345,7 @@ useEffect(() => {
 
       if (data.status === "completed") {
         setAnalysisResults(data?.result?.results || []);
+        setMediaAnalysisResult(data?.result || null);
         setAnalysisLoading(false);
         setMediaJobId(null);
         return;
@@ -266,7 +390,7 @@ return (
       <div>
         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block mb-4">Platforms</label>
         <div className="space-y-2">
-          {PLATFORMS.map(p => (
+          {platformOptions.map(p => (
             <button key={p.id} onClick={() => toggle(selectedPlatforms, setSelectedPlatforms, p.id)} className={`w-full flex items-center justify-between p-3 rounded-xl border-2 transition-all ${selectedPlatforms.includes(p.id) ? 'border-indigo-600 bg-indigo-50' : 'border-slate-50 bg-white hover:border-slate-200'}`}>
               <div className="flex items-center gap-2">{p.icon} <span className="text-sm font-semibold text-slate-700">{p.name}</span></div>
               {selectedPlatforms.includes(p.id) && <CheckCircle2 className="w-4 h-4 text-indigo-600 fill-indigo-50" />}
@@ -278,7 +402,7 @@ return (
       <div>
         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block mb-4">Target Regions</label>
         <div className="flex flex-wrap gap-2">
-          {COUNTRIES.map(c => (
+          {countryOptions.map(c => (
             <button key={c} onClick={() => toggle(selectedCountries, setSelectedCountries, c)} className={`px-3 py-1.5 rounded-full border text-[11px] font-bold transition-all ${selectedCountries.includes(c) ? 'bg-slate-900 text-white' : 'bg-white text-slate-500 hover:border-slate-400'}`}>
               {c}
             </button>
@@ -372,6 +496,7 @@ return (
             setIsRemediated(false);
             setShowResults(false);
             setProgress(0);
+            setMediaAnalysisResult(null);
           }}
             className={`px-4 py-2 rounded-xl font-bold capitalize border transition-all ${mode === m ? 'border-indigo-600 bg-indigo-50 text-indigo-600' : 'border-slate-200 text-slate-500 hover:border-slate-400'}`}>
             {m}
@@ -458,6 +583,7 @@ return (
     setIsRemediated(false);
     setIsRemediating(false);
     setProgress(0);
+    setMediaAnalysisResult(null);
   }}
   className="absolute top-6 right-6 z-20 p-2 bg-white/80 backdrop-blur rounded-full shadow-md hover:text-red-500"
 >
@@ -465,10 +591,26 @@ return (
 </button>
 
               <div className="w-full h-full flex items-center justify-center rounded-2xl overflow-hidden bg-slate-900 shadow-inner">
-                {mode === "video"
-                  ? <video src={previewUrl!} controls className="max-w-full max-h-full" />
-                  : <img src={previewUrl!} alt="Preview" className="max-w-full max-h-full object-contain" />
-                }
+                {mode === "video" ? (
+                  <video src={previewUrl!} controls className="max-w-full max-h-full" />
+                ) : (
+                  <div className="relative inline-block max-w-full max-h-full">
+                    <img src={previewUrl!} alt="Preview" className="block max-w-full max-h-full object-contain" />
+                    {getMediaFrameAnalyses()[0]?.violations &&
+                      renderViolationBoxes(getMediaFrameAnalyses()[0].violations)?.map(({ key, region }) => (
+                        <div
+                          key={key}
+                          className="absolute border-2 border-emerald-500 bg-emerald-400/10 shadow-[0_0_0_1px_rgba(34,197,94,0.35)]"
+                          style={{
+                            left: `${Math.max(0, Number(region?.x || 0)) * 100}%`,
+                            top: `${Math.max(0, Number(region?.y || 0)) * 100}%`,
+                            width: `${Math.max(0, Number(region?.width || 0)) * 100}%`,
+                            height: `${Math.max(0, Number(region?.height || 0)) * 100}%`,
+                          }}
+                        />
+                      ))}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -499,32 +641,123 @@ return (
             </div>
           )}
 
+          {mode !== "text" && !analysisLoading && !analysisError && Array.isArray(mediaAnalysisResult?.frame_analyses) && mediaAnalysisResult.frame_analyses.length > 0 && (
+            <div className="space-y-3 mb-4">
+              <p className="text-[11px] text-slate-500 font-bold uppercase tracking-wide">Analyzed Frames</p>
+              {mediaAnalysisResult.frame_analyses.map((frame: any, frameIndex: number) => {
+                const frameViolations = Array.isArray(frame?.violations) ? frame.violations : [];
+
+                return (
+                  <div key={`${frameIndex}-${frame?.timestamp ?? "frame"}`} className="p-3 rounded-xl border border-emerald-200 bg-emerald-50/50 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs font-bold text-emerald-700">Frame {frameIndex + 1}</p>
+                      <p className="text-[11px] text-slate-500">
+                        {typeof frame?.timestamp === "number" ? `${frame.timestamp.toFixed(2)}s` : "timestamp unavailable"}
+                      </p>
+                    </div>
+
+                    {frame.frame_preview ? (
+                      <div className="relative inline-block max-w-full overflow-hidden rounded-lg border border-emerald-200 bg-white">
+                        <img src={frame.frame_preview} alt={`Analyzed frame ${frameIndex + 1}`} className="block max-w-full h-auto" />
+                        {renderViolationBoxes(frameViolations)?.map(({ key, region }) => (
+                          <div
+                            key={key}
+                            className="absolute border-2 border-emerald-500 bg-emerald-400/10"
+                            style={{
+                              left: `${Math.max(0, Number(region?.x || 0)) * 100}%`,
+                              top: `${Math.max(0, Number(region?.y || 0)) * 100}%`,
+                              width: `${Math.max(0, Number(region?.width || 0)) * 100}%`,
+                              height: `${Math.max(0, Number(region?.height || 0)) * 100}%`,
+                            }}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+
+                    {frame.description && <p className="text-xs text-slate-600">{frame.description}</p>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {!analysisLoading && !analysisError && mode === "text" && (
             <>
               {analysisResults && analysisResults.length > 0 ? (
                 analysisResults.map((result, i) => {
                   const label = result.label || `Guideline ${i + 1}`;
+                  const violations = result.violations || [];
                   const answer: string = result.answer || "";
 
                   return (
                     <div
                       key={result.doc_id || i}
-                      className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-2"
+                      className="space-y-2 mb-4"
                     >
-                      <p className="text-xs text-red-500 font-bold mb-1 uppercase tracking-wide">
+                      <p className="text-xs text-red-500 font-bold uppercase tracking-wide">
                         {label}
                       </p>
-                      <p className="text-slate-800 whitespace-pre-line">
-                        {answer || "No clear violations were identified in this guideline."}
-                      </p>
+                      
+                      {/* Structured violations as numbered cards */}
+                      {violations.length > 0 ? (
+                        <div className="space-y-2">
+                          {violations.map((violation: any, vIdx: number) => (
+                            <div
+                              key={vIdx}
+                              className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-1"
+                            >
+                              <div className="flex gap-2">
+                                <span className="bg-red-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">
+                                  {vIdx + 1}
+                                </span>
+                                <div className="flex-1">
+                                  {violation.ref && (
+                                    <p className="text-xs font-bold text-red-700">{violation.ref}</p>
+                                  )}
+                                  {violation.explanation && (
+                                    <p className="text-slate-800">{violation.explanation}</p>
+                                  )}
+                                  {violation.remediation && (
+                                    <p className="text-xs text-slate-600 mt-1">
+                                      <span className="font-bold">Remediation:</span> {violation.remediation}
+                                    </p>
+                                  )}
 
-                      {Array.isArray(result.sources) && result.sources.length > 0 && (
-                        <p className="text-[11px] text-slate-500">
-                          Based on sections: {result.sources
-                            .map((s: any) => s?.title || s?.node_id)
-                            .filter(Boolean)
-                            .join(", ")}
-                        </p>
+                                  {Array.isArray(result.sources) && result.sources.length > 0 && (
+                                    <p className="text-[11px] text-slate-500 pt-2 border-t border-red-100">
+                                      Based on: {result.sources
+                                        .map((source: any) => {
+                                          const pageIndex = source?.page_index ? `p.${source.page_index}` : null;
+                                          return [source?.title || source?.node_id, pageIndex].filter(Boolean).join(" ");
+                                        })
+                                        .filter(Boolean)
+                                        .join(", ")}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        /* Fallback to plain answer if no structured violations */
+                        <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-2">
+                          <p className="text-slate-800 whitespace-pre-line">
+                            {answer || "No clear violations were identified in this guideline."}
+                          </p>
+
+                          {Array.isArray(result.sources) && result.sources.length > 0 && (
+                            <p className="text-[11px] text-slate-500">
+                              Based on sections: {result.sources
+                                .map((source: any) => {
+                                  const pageIndex = source?.page_index ? `p.${source.page_index}` : null;
+                                  return [source?.title || source?.node_id, pageIndex].filter(Boolean).join(" ");
+                                })
+                                .filter(Boolean)
+                                .join(", ")}
+                            </p>
+                          )}
+                        </div>
                       )}
                     </div>
                   );
@@ -540,19 +773,83 @@ return (
           {mode !== "text" && !analysisLoading && !analysisError && (
             <>
               {analysisResults && analysisResults.length > 0 ? (
-                analysisResults.map((result, i) => (
-                  <div
-                    key={result.doc_id || i}
-                    className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-2"
-                  >
-                    <p className="text-xs text-red-500 font-bold mb-1 uppercase tracking-wide">
-                      {result.label || `Guideline ${i + 1}`}
-                    </p>
-                    <p className="text-slate-800 whitespace-pre-line">
-                      {result.answer || "No clear violations were identified in this guideline."}
-                    </p>
-                  </div>
-                ))
+                analysisResults.map((result, i) => {
+                  const violations = result.violations || [];
+                  const answer: string = result.answer || "";
+
+                  return (
+                    <div
+                      key={result.doc_id || i}
+                      className="mb-4"
+                    >
+                      <p className="text-xs text-red-500 font-bold uppercase tracking-wide mb-2">
+                        {result.label || `Guideline ${i + 1}`}
+                      </p>
+
+                      {/* Structured violations as numbered cards */}
+                      {violations.length > 0 ? (
+                        <div className="space-y-2">
+                          {violations.map((violation: any, vIdx: number) => (
+                            <div
+                              key={vIdx}
+                              className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-1"
+                            >
+                              <div className="flex gap-2">
+                                <span className="bg-red-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">
+                                  {vIdx + 1}
+                                </span>
+                                <div className="flex-1">
+                                  {violation.ref && (
+                                    <p className="text-xs font-bold text-red-700">{violation.ref}</p>
+                                  )}
+                                  {violation.explanation && (
+                                    <p className="text-slate-800">{violation.explanation}</p>
+                                  )}
+                                  {violation.remediation && (
+                                    <p className="text-xs text-slate-600 mt-1">
+                                      <span className="font-bold">Remediation:</span> {violation.remediation}
+                                    </p>
+                                  )}
+
+                                  {Array.isArray(result.sources) && result.sources.length > 0 && (
+                                    <p className="text-[11px] text-slate-500 pt-2 border-t border-red-100">
+                                      Based on: {result.sources
+                                        .map((source: any) => {
+                                          const pageIndex = source?.page_index ? `p.${source.page_index}` : null;
+                                          return [source?.title || source?.node_id, pageIndex].filter(Boolean).join(" ");
+                                        })
+                                        .filter(Boolean)
+                                        .join(", ")}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        /* Fallback to plain answer if no structured violations */
+                        <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-2">
+                          <p className="text-slate-800 whitespace-pre-line">
+                            {answer || "No clear violations were identified in this guideline."}
+                          </p>
+
+                          {Array.isArray(result.sources) && result.sources.length > 0 && (
+                            <p className="text-[11px] text-slate-500">
+                              Based on sections: {result.sources
+                                .map((source: any) => {
+                                  const pageIndex = source?.page_index ? `p.${source.page_index}` : null;
+                                  return [source?.title || source?.node_id, pageIndex].filter(Boolean).join(" ");
+                                })
+                                .filter(Boolean)
+                                .join(", ")}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
               ) : (
                 <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
                   Upload a {mode} file and click Run Analysis to start asynchronous guideline checks.

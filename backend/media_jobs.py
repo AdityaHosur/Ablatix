@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import subprocess
 import tempfile
@@ -13,6 +14,30 @@ OLLAMA_CHAT_URL = "https://ollama.com/api/chat"
 
 _MEDIA_JOBS: Dict[str, Dict[str, Any]] = {}
 _MEDIA_JOBS_LOCK = threading.Lock()
+
+
+def _extract_json(content: str) -> Dict[str, Any]:
+    """Extract JSON from content with robust fallback handling."""
+    if not content:
+        return {}
+
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return {}
+        return {}
 
 
 def _utc_now_iso() -> str:
@@ -70,6 +95,42 @@ def append_media_job_error(job_id: str, stage: str, message: str, recoverable: b
         )
         job["errors"] = errors
         job["updated_at"] = _utc_now_iso()
+
+
+def _parse_vision_analysis(response: str) -> Dict[str, Any]:
+    """Parse vision model response for violations with normalized coordinates.
+    
+    Returns dict with 'violations' array and 'description' fallback.
+    Violations include: {type, confidence, regions: [{x, y, width, height}]}
+    """
+    violations = []
+    description = response
+    
+    # Try to extract JSON first
+    parsed = _extract_json(response)
+    if isinstance(parsed, dict) and "violations" in parsed:
+        violations = parsed.get("violations", [])
+        parsed_description = parsed.get("description")
+        if isinstance(parsed_description, str) and parsed_description.strip():
+            description = parsed_description.strip()
+        # Validate and normalize coordinates to 0-1
+        for v in violations:
+            if "regions" in v and isinstance(v["regions"], list):
+                for region in v["regions"]:
+                    # Clamp to 0-1 if not already
+                    region["x"] = max(0, min(1, region.get("x", 0)))
+                    region["y"] = max(0, min(1, region.get("y", 0)))
+                    region["width"] = max(0, min(1, region.get("width", 0)))
+                    region["height"] = max(0, min(1, region.get("height", 0)))
+    
+    return {
+        "violations": violations,
+        "description": description,
+    }
+
+
+def frame_bytes_to_data_url(frame_bytes: bytes) -> str:
+    return f"data:image/jpeg;base64,{base64.b64encode(frame_bytes).decode('utf-8')}"
 
 
 def analyze_image_with_ollama(image_bytes: bytes, model: str, api_key: str, prompt: str) -> str:
