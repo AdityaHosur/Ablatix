@@ -18,6 +18,11 @@ sentence-transformers
 numpy
 faiss-cpu
 fitz
-jina
+# jina
 python-dotenv
 google-genai
+opencv-python
+decord
+ultralytics
+nudenet
+openai-whisper

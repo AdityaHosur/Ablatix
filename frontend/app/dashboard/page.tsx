@@ -37,6 +37,14 @@ const [isRemediated, setIsRemediated] = useState(false);
 
 const [progress, setProgress] = useState(0);
 
+// RAG analysis state
+const [analysisLoading, setAnalysisLoading] = useState(false);
+const [analysisError, setAnalysisError] = useState<string | null>(null);
+const [analysisResults, setAnalysisResults] = useState<any[] | null>(null);
+const [mediaJobId, setMediaJobId] = useState<string | null>(null);
+const [mediaJobStage, setMediaJobStage] = useState<string>("");
+const [mediaJobProgress, setMediaJobProgress] = useState<number>(0);
+
 const fileInputRef = useRef<HTMLInputElement>(null);
 
 useEffect(() => {
@@ -99,6 +107,152 @@ const getInitials = (name: string) => {
     .join("")
     .toUpperCase();
 };
+
+const runTextAnalysis = async () => {
+  if (analysisLoading) return;
+  if (!textInput.trim()) return;
+
+  setShowResults(true);
+  setAnalysisLoading(true);
+  setAnalysisError(null);
+  setAnalysisResults(null);
+
+  try {
+    const res = await fetch("/api/violations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        description: textInput,
+        platforms: selectedPlatforms,
+        countries: selectedCountries,
+      }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok || !data.success) {
+      setAnalysisError(
+        data?.message ||
+          "Analysis failed. Please try again or adjust your selections."
+      );
+      setAnalysisResults(null);
+      return;
+    }
+
+    setAnalysisResults(data.results || []);
+  } catch (err: any) {
+    setAnalysisError(
+      err?.message || "Unable to contact analysis service. Please try again."
+    );
+    setAnalysisResults(null);
+  } finally {
+    setAnalysisLoading(false);
+  }
+};
+
+const runMediaAnalysis = async () => {
+  if (analysisLoading) return;
+  if (!file) return;
+
+  setShowResults(true);
+  setAnalysisLoading(true);
+  setAnalysisError(null);
+  setAnalysisResults(null);
+  setMediaJobId(null);
+  setMediaJobStage("queued");
+  setMediaJobProgress(0);
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("media_type", mode);
+    formData.append("description", textInput || "");
+    formData.append("platforms", JSON.stringify(selectedPlatforms));
+    formData.append("countries", JSON.stringify(selectedCountries));
+    formData.append("include_audio", "true");
+
+    const res = await fetch("/api/violations", {
+      method: "POST",
+      body: formData,
+    });
+
+    const data = await res.json();
+
+    if (!res.ok || !data.job_id) {
+      setAnalysisError(
+        data?.message || data?.detail || "Failed to start media analysis job."
+      );
+      setAnalysisLoading(false);
+      return;
+    }
+
+    setMediaJobId(data.job_id);
+  } catch (err: any) {
+    setAnalysisError(
+      err?.message || "Unable to start media analysis. Please try again."
+    );
+    setAnalysisLoading(false);
+  }
+};
+
+useEffect(() => {
+  if (!mediaJobId) return;
+
+  let alive = true;
+  let timer: any;
+
+  const poll = async () => {
+    try {
+      const res = await fetch(`/api/violations?jobId=${mediaJobId}`);
+      const data = await res.json();
+
+      if (!alive) return;
+
+      if (!res.ok) {
+        setAnalysisError(data?.message || "Failed to fetch media analysis status.");
+        setAnalysisLoading(false);
+        setMediaJobId(null);
+        return;
+      }
+
+      setMediaJobStage(data.stage || data.status || "processing");
+      setMediaJobProgress(data.progress || 0);
+
+      if (data.status === "completed") {
+        setAnalysisResults(data?.result?.results || []);
+        setAnalysisLoading(false);
+        setMediaJobId(null);
+        return;
+      }
+
+      if (data.status === "failed") {
+        const firstError = Array.isArray(data.errors) && data.errors.length > 0
+          ? data.errors[0]?.message
+          : null;
+        setAnalysisError(firstError || "Media analysis failed.");
+        setAnalysisLoading(false);
+        setMediaJobId(null);
+        return;
+      }
+
+      timer = setTimeout(poll, 2000);
+    } catch {
+      if (!alive) return;
+      setAnalysisError("Error while polling media analysis status.");
+      setAnalysisLoading(false);
+      setMediaJobId(null);
+    }
+  };
+
+  poll();
+
+  return () => {
+    alive = false;
+    if (timer) clearTimeout(timer);
+  };
+}, [mediaJobId]);
 return ( 
 <div className="min-h-screen bg-slate-50 flex font-[family-name:var(--font-geist-sans)] text-slate-900">
 
@@ -190,11 +344,21 @@ return (
   </div>
 
   <button
-    onClick={() => { setShowResults(true); setIsRemediated(false); }}
-    disabled={mode === "text" ? !textInput : !file}
+    onClick={async () => {
+      setIsRemediated(false);
+      setIsRemediating(false);
+      setProgress(0);
+
+      if (mode === "text") {
+        await runTextAnalysis();
+      } else {
+        await runMediaAnalysis();
+      }
+    }}
+    disabled={mode === "text" ? !textInput.trim() || analysisLoading : !file || analysisLoading}
     className="bg-indigo-600 disabled:opacity-30 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2"
   >
-    <Zap /> Run Analysis
+    <Zap /> {analysisLoading ? "Running..." : "Run Analysis"}
   </button>
 
 </header>
@@ -316,13 +480,86 @@ return (
       <div className="w-[380px] bg-white border border-slate-200 rounded-[2.5rem] shadow-sm p-6 flex flex-col">
         <h3 className="font-bold mb-4">Detected Violations</h3>
 
-        <div className="flex-1 space-y-3">
-          {[{ time: "00:05", text: "Violation detected" }].map((v, i) => (
-            <div key={i} className="p-3 rounded-xl bg-red-50 border border-red-200">
-              <p className="text-xs text-red-500 font-bold">{v.time}</p>
-              <p>{v.text}</p>
+        <div className="flex-1 space-y-3 overflow-y-auto">
+          {analysisLoading && mode === "text" && (
+            <div className="p-3 rounded-xl bg-indigo-50 border border-indigo-200 text-sm text-indigo-700 font-medium">
+              Running analysis against your selected guideline documents...
             </div>
-          ))}
+          )}
+
+          {analysisLoading && mode !== "text" && (
+            <div className="p-3 rounded-xl bg-indigo-50 border border-indigo-200 text-sm text-indigo-700 font-medium">
+              Processing {mode} job: {mediaJobStage || "processing"} ({mediaJobProgress}%)
+            </div>
+          )}
+
+          {analysisError && (
+            <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700 font-medium">
+              {analysisError}
+            </div>
+          )}
+
+          {!analysisLoading && !analysisError && mode === "text" && (
+            <>
+              {analysisResults && analysisResults.length > 0 ? (
+                analysisResults.map((result, i) => {
+                  const label = result.label || `Guideline ${i + 1}`;
+                  const answer: string = result.answer || "";
+
+                  return (
+                    <div
+                      key={result.doc_id || i}
+                      className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-2"
+                    >
+                      <p className="text-xs text-red-500 font-bold mb-1 uppercase tracking-wide">
+                        {label}
+                      </p>
+                      <p className="text-slate-800 whitespace-pre-line">
+                        {answer || "No clear violations were identified in this guideline."}
+                      </p>
+
+                      {Array.isArray(result.sources) && result.sources.length > 0 && (
+                        <p className="text-[11px] text-slate-500">
+                          Based on sections: {result.sources
+                            .map((s: any) => s?.title || s?.node_id)
+                            .filter(Boolean)
+                            .join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })
+              ) : (
+                <p className="text-xs text-slate-400">
+                  No analysis results yet. Enter text, choose guidelines, and run analysis.
+                </p>
+              )}
+            </>
+          )}
+
+          {mode !== "text" && !analysisLoading && !analysisError && (
+            <>
+              {analysisResults && analysisResults.length > 0 ? (
+                analysisResults.map((result, i) => (
+                  <div
+                    key={result.doc_id || i}
+                    className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm space-y-2"
+                  >
+                    <p className="text-xs text-red-500 font-bold mb-1 uppercase tracking-wide">
+                      {result.label || `Guideline ${i + 1}`}
+                    </p>
+                    <p className="text-slate-800 whitespace-pre-line">
+                      {result.answer || "No clear violations were identified in this guideline."}
+                    </p>
+                  </div>
+                ))
+              ) : (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
+                  Upload a {mode} file and click Run Analysis to start asynchronous guideline checks.
+                </div>
+              )}
+            </>
+          )}
         </div>
 
         {!isRemediated ? (
