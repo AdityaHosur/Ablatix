@@ -109,6 +109,11 @@ const [mediaAnalysisResult, setMediaAnalysisResult] = useState<any | null>(null)
 const [mediaJobId, setMediaJobId] = useState<string | null>(null);
 const [mediaJobStage, setMediaJobStage] = useState<string>("");
 const [mediaJobProgress, setMediaJobProgress] = useState<number>(0);
+const [lastMediaJobId, setLastMediaJobId] = useState<string | null>(null);
+
+// Remediation state
+const [remediationData, setRemediationData] = useState<any | null>(null);
+const [remediationStats, setRemediationStats] = useState<any | null>(null);
 
 const [availableDocIds, setAvailableDocIds] = useState<any>({});
 const [isLoadingDocIds, setIsLoadingDocIds] = useState(true);
@@ -142,24 +147,94 @@ setIsRemediated(false);
 setShowResults(false);
 setProgress(0);
 setMediaAnalysisResult(null);
+setRemediationData(null);
+setRemediationStats(null);
+setLastMediaJobId(null);
 
 
 };
 
-const handleDownload = () => {
-if (mode === "text") {
-const blob = new Blob([textInput], { type: "text/plain" });
-const url = URL.createObjectURL(blob);
-const a = document.createElement("a");
-a.href = url;
-a.download = "remediated.txt";
-a.click();
-} else if (previewUrl) {
-const a = document.createElement("a");
-a.href = previewUrl;
-a.download = `remediated.${mode === "video" ? "mp4" : "png"}`;
-a.click();
-}
+const handleDownload = async () => {
+  if (mode === "text") {
+    // For text, we processed it locally, so download the input
+    const blob = new Blob([textInput], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "remediated.txt";
+    a.click();
+    URL.revokeObjectURL(url);
+  } else if (remediationData) {
+    // For image/video, get the actual remediated file from backend
+    const remediatedPath = mode === "image" 
+      ? remediationData.image_path 
+      : remediationData.video_path;
+    
+    if (!remediatedPath) {
+      alert("Remediated file not available. Please run remediation first.");
+      return;
+    }
+
+    try {
+      // Extract filename from path (e.g., "data/violation_results/media_xyz_remediated.mp4")
+      const filename = remediatedPath.split("/").pop() || `remediated.${mode === "video" ? "mp4" : "png"}`;
+      
+      // Download from backend file-serving endpoint
+      const downloadUrl = `/api/violations/remediated/${filename}`;
+      const response = await fetch(downloadUrl);
+      
+      if (!response.ok) {
+        throw new Error(`Failed to download remediated ${mode}: ${response.statusText}`);
+      }
+      
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Download error:", err);
+      alert(`Failed to download remediated ${mode}. Please try again.`);
+    }
+  }
+};
+
+const handleRemediate = async () => {
+  const jobToRemediate = mediaJobId || lastMediaJobId;
+  if (!jobToRemediate) {
+    alert("No media job available to remediate.");
+    return;
+  }
+
+  setIsRemediating(true);
+  try {
+    const res = await fetch("/api/violations/media/remediate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobToRemediate }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText || "Remediation failed");
+    }
+
+    const data = await res.json();
+    if (data?.success && data.remediation) {
+      setRemediationData(data.remediation);
+      setRemediationStats(data.remediation.stats || null);
+      setIsRemediated(true);
+    } else {
+      throw new Error("Remediation did not complete successfully");
+    }
+  } catch (err: any) {
+    console.error("Remediation error:", err);
+    alert(`Remediation failed: ${err?.message || err}`);
+  } finally {
+    setIsRemediating(false);
+  }
 };
 
 const [user, setUser] = useState<any>(null);
@@ -284,6 +359,7 @@ const runMediaAnalysis = async () => {
   setAnalysisResults(null);
   setMediaAnalysisResult(null);
   setMediaJobId(null);
+  setLastMediaJobId(null);
   setMediaJobStage("queued");
   setMediaJobProgress(0);
 
@@ -312,6 +388,7 @@ const runMediaAnalysis = async () => {
     }
 
     setMediaJobId(data.job_id);
+    setLastMediaJobId(data.job_id);
   } catch (err: any) {
     setAnalysisError(
       err?.message || "Unable to start media analysis. Please try again."
@@ -346,6 +423,14 @@ useEffect(() => {
       if (data.status === "completed") {
         setAnalysisResults(data?.result?.results || []);
         setMediaAnalysisResult(data?.result || null);
+        
+        // Extract remediation data from result (do not auto-mark remediated)
+        if (data?.result?.remediation) {
+          setRemediationData(data.result.remediation);
+          setRemediationStats(data.result.remediation.stats);
+          // Do NOT set isRemediated here — user must click Remediate to perform remediation
+        }
+        
         setAnalysisLoading(false);
         setMediaJobId(null);
         return;
@@ -377,6 +462,13 @@ useEffect(() => {
     if (timer) clearTimeout(timer);
   };
 }, [mediaJobId]);
+
+// Determine if analysis detected any violations (used to show Remediate button)
+const hasViolations = Boolean(
+  mediaAnalysisResult &&
+  Array.isArray(mediaAnalysisResult.frame_analyses) &&
+  mediaAnalysisResult.frame_analyses.some((f: any) => Array.isArray(f.violations) && f.violations.length > 0)
+);
 return ( 
 <div className="min-h-screen bg-slate-50 flex font-[family-name:var(--font-geist-sans)] text-slate-900">
 
@@ -497,6 +589,9 @@ return (
             setShowResults(false);
             setProgress(0);
             setMediaAnalysisResult(null);
+            setRemediationData(null);
+            setRemediationStats(null);
+            setLastMediaJobId(null);
           }}
             className={`px-4 py-2 rounded-xl font-bold capitalize border transition-all ${mode === m ? 'border-indigo-600 bg-indigo-50 text-indigo-600' : 'border-slate-200 text-slate-500 hover:border-slate-400'}`}>
             {m}
@@ -529,6 +624,8 @@ return (
     setIsRemediated(false);
     setIsRemediating(false);
     setProgress(0);
+    setRemediationData(null);
+    setRemediationStats(null);
   }
 }}
             placeholder="Enter the text..."
@@ -584,6 +681,8 @@ return (
     setIsRemediating(false);
     setProgress(0);
     setMediaAnalysisResult(null);
+    setRemediationData(null);
+    setRemediationStats(null);
   }}
   className="absolute top-6 right-6 z-20 p-2 bg-white/80 backdrop-blur rounded-full shadow-md hover:text-red-500"
 >
@@ -859,37 +958,62 @@ return (
           )}
         </div>
 
-        {!isRemediated ? (
-          <button
-            onClick={() => {
-              setIsRemediating(true);
-              setProgress(0);
-
-              let fake = 0;
-              const interval = setInterval(() => {
-                fake += Math.random() * 15;
-
-                if (fake >= 100) {
-                  fake = 100;
-                  clearInterval(interval);
-
-                  setTimeout(() => {
-                    setIsRemediating(false);
-                    setIsRemediated(true);
-                  }, 300);
-                }
-
-                setProgress(Math.floor(fake));
-              }, 200);
-            }}
-            className="mt-4 bg-red-500 text-white py-3 rounded-xl font-bold"
-          >
-            Remediate {mode}
-          </button>
+        {remediationData && remediationData.enabled && isRemediated ? (
+          <div className="mt-4 space-y-3">
+            {/* Remediation Stats */}
+            {remediationStats && (
+              <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 space-y-2">
+                <p className="text-xs font-bold text-emerald-700 uppercase tracking-wide">Remediation Complete ✓</p>
+                {mode === "video" && remediationStats.total_frames && (
+                  <>
+                    <p className="text-[11px] text-slate-600">
+                      <span className="font-semibold">Frames processed:</span> {remediationStats.total_frames} total
+                    </p>
+                    <p className="text-[11px] text-slate-600">
+                      <span className="font-semibold">Violations fixed:</span> {remediationStats.remediated_frames} frames
+                    </p>
+                    {remediationStats.fps && (
+                      <p className="text-[11px] text-slate-600">
+                        <span className="font-semibold">Resolution:</span> {remediationStats.width}x{remediationStats.height} @ {remediationStats.fps}fps
+                      </p>
+                    )}
+                  </>
+                )}
+                {mode === "image" && remediationStats.regions_blurred && (
+                  <p className="text-[11px] text-slate-600">
+                    <span className="font-semibold">Regions blurred:</span> {remediationStats.regions_blurred}
+                  </p>
+                )}
+              </div>
+            )}
+            
+            {/* Download Button */}
+            <button 
+              onClick={handleDownload} 
+              className="w-full bg-emerald-500 text-white py-3 rounded-xl font-bold hover:bg-emerald-600 transition-colors"
+            >
+              Download Remediated {mode === "text" ? "Text" : mode === "video" ? "Video" : "Image"}
+            </button>
+          </div>
+        ) : hasViolations ? (
+          <div className="mt-4 space-y-3">
+            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
+              <p className="font-semibold">Violations detected</p>
+              <p className="text-xs mt-1">Click below to run remediation for the detected violations.</p>
+            </div>
+            <button
+              onClick={handleRemediate}
+              disabled={isRemediating}
+              className="w-full bg-amber-600 text-white py-3 rounded-xl font-bold hover:bg-amber-700 transition-colors"
+            >
+              {isRemediating ? "Remediating..." : "Run Remediation"}
+            </button>
+          </div>
         ) : (
-          <button onClick={handleDownload} className="mt-4 bg-emerald-500 text-white py-3 rounded-xl font-bold">
-            Download Remediated {mode}
-          </button>
+          <div className="mt-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
+            <p className="font-semibold">Remediation not available</p>
+            <p className="text-xs mt-1">Backend remediation is currently disabled or no violations were detected.</p>
+          </div>
         )}
       </div>
     )}

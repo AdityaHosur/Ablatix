@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -28,6 +29,14 @@ from media_jobs import (
     _parse_vision_analysis,
     frame_bytes_to_data_url,
 )
+from remediation import (
+    remediate_media,
+    process_text,
+    remediate_image_file,
+    remediate_video,
+    remediate_audio_wav,
+)
+import shutil
 
 app = FastAPI()
 
@@ -56,7 +65,16 @@ except ImportError as e:
 print("Loading LLM (Ollama Cloud)...")
 # Uses OLLAMA_API_KEY and model name configured for Ollama Cloud.
 groq_client = None  # Kept for backward compatibility with run_reasoning_rag signature
-GROQ_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:397b-cloud")
+GROQ_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
+
+# ─────────────────────────────────────────────
+# Remediation configuration
+# ─────────────────────────────────────────────
+ENABLE_REMEDIATION = os.environ.get("ENABLE_REMEDIATION", "true").lower() == "true"
+BLUR_STRENGTH = int(os.environ.get("BLUR_STRENGTH", "51"))
+USE_BEEP_FOR_AUDIO = os.environ.get("USE_BEEP_FOR_AUDIO", "true").lower() == "true"
+
+print(f"Remediation settings: ENABLED={ENABLE_REMEDIATION}, BLUR_STRENGTH={BLUR_STRENGTH}, USE_BEEP={USE_BEEP_FOR_AUDIO}")
 print("All components loaded!")
 
 
@@ -466,6 +484,43 @@ def _resolve_docs_by_selection(platforms: List[str], countries: List[str]) -> Li
     return docs
 
 
+def _extract_bboxes_from_violations(violations: List[Dict], frame_width: int, frame_height: int) -> List[Dict]:
+    """
+    Convert normalized violation coordinates (0-1) to pixel coordinates.
+    
+    Args:
+        violations: List of violation dicts with 'regions' (normalized coords)
+        frame_width: Frame width in pixels
+        frame_height: Frame height in pixels
+    
+    Returns:
+        List of bbox dicts with pixel coordinates [x1, y1, x2, y2]
+    """
+    bboxes = []
+    for violation in violations:
+        regions = violation.get("regions", [])
+        for region in regions:
+            try:
+                # Normalized coordinates: x, y, width, height (all 0-1)
+                norm_x = float(region.get("x", 0))
+                norm_y = float(region.get("y", 0))
+                norm_width = float(region.get("width", 0.1))
+                norm_height = float(region.get("height", 0.1))
+                
+                # Convert to pixel coordinates
+                x1 = int(norm_x * frame_width)
+                y1 = int(norm_y * frame_height)
+                x2 = int((norm_x + norm_width) * frame_width)
+                y2 = int((norm_y + norm_height) * frame_height)
+                
+                bboxes.append({"bbox": [x1, y1, x2, y2]})
+            except (ValueError, TypeError) as e:
+                print(f"⚠️  Error parsing region {region}: {e}")
+                continue
+    
+    return bboxes
+
+
 def _run_violation_query(
     description: str,
     docs: List[ViolationDocDescriptor],
@@ -804,6 +859,9 @@ def _process_media_job(
 
     frame_analyses: List[Dict[str, Any]] = []
     transcript_segments: List[Dict[str, Any]] = []
+    remediated_image_path: Optional[str] = None
+    remediated_video_path: Optional[str] = None
+    remediation_stats: Dict[str, Any] = {}
 
     try:
         ollama_api_key = os.environ.get("OLLAMA_API_KEY", "")
@@ -837,6 +895,10 @@ def _process_media_job(
             analyzed = _parse_vision_analysis(desc)
             frame_analyses.append({"timestamp": 0.0, "violations": analyzed.get("violations", []), "description": analyzed.get("description", "")})
             update_media_job(job_id, progress=45, stage="image-analysis")
+            
+            # Do NOT perform automatic remediation here. Persist original media so remediation
+            # can be triggered later via the on-demand endpoint.
+            remediated_image_path = None
         else:
             frames = extract_video_sample_frames(media_path, max_frames=6)
             update_media_job(job_id, progress=25, stage="frame-extraction")
@@ -891,6 +953,10 @@ def _process_media_job(
                     if audio_path and os.path.exists(audio_path):
                         os.remove(audio_path)
 
+            # Do NOT perform automatic remediation here. Persist original media so remediation
+            # can be triggered later via the on-demand endpoint.
+            remediated_video_path = None
+
         synthesized_description = synthesize_media_description(
             media_type=media_type,
             user_description=user_description,
@@ -906,6 +972,18 @@ def _process_media_job(
             top_n_for_llm=top_n_for_llm,
         )
 
+        # Persist original uploaded media for on-demand remediation
+        try:
+            originals_dir = RESULTS_DIR / "originals"
+            originals_dir.mkdir(parents=True, exist_ok=True)
+            orig_basename = f"{job_id}_{os.path.basename(media_path)}"
+            orig_dest = originals_dir / orig_basename
+            shutil.copy(media_path, orig_dest)
+            original_rel = str((Path("data") / "violation_results" / "originals" / orig_basename).as_posix())
+        except Exception as e:
+            print(f"⚠️  Failed to persist original media: {e}")
+            original_rel = None
+
         result_payload = {
             "kind": "media",
             "created_at": _utc_now_iso(),
@@ -915,6 +993,14 @@ def _process_media_job(
             "audio_transcription": transcript_segments,
             "selected_docs": [doc.model_dump() for doc in docs],
             "results": [r.model_dump() for r in violations.results],
+            "remediation": {
+                # Only mark remediation enabled if we actually have a remediated file
+                "enabled": bool(remediated_image_path or remediated_video_path),
+                "original_path": original_rel,
+                "image_path": remediated_image_path,
+                "video_path": remediated_video_path,
+                "stats": remediation_stats or {},
+            }
         }
         storage_path = _persist_violation_result("media", result_payload)
         result_payload["storage_path"] = storage_path
@@ -929,23 +1015,69 @@ def _process_media_job(
 
     except Exception as e:
         append_media_job_error(job_id, stage="fatal", message=str(e), recoverable=False)
-        failure_payload = {
+        result_payload = {
             "kind": "media",
             "created_at": _utc_now_iso(),
-            "job_id": job_id,
             "media_type": media_type,
-            "description": user_description,
-            "selected_docs": [doc.model_dump() for doc in docs],
+            "description": synthesized_description,
             "frame_analyses": frame_analyses,
             "audio_transcription": transcript_segments,
-            "error": str(e),
+            "selected_docs": [doc.model_dump() for doc in docs],
+            "results": [r.model_dump() for r in violations.results],
+            "remediation": {
+                # Remediation will be performed on-demand by user action
+                "enabled": False,
+                "original_path": original_rel,
+                "image_path": None,
+                "video_path": None,
+                "stats": {},
+            }
         }
-        failure_storage_path = _persist_violation_result("media_failed", failure_payload)
-        failure_payload["storage_path"] = failure_storage_path
-        update_media_job(job_id, status="failed", stage="failed", progress=100, result=failure_payload)
-    finally:
-        if os.path.exists(media_path):
-            os.remove(media_path)
+
+@app.get("/violations/media/remediated/{filename}")
+async def get_remediated_media(filename: str):
+    """
+    Serve remediated media files (images, videos) from violation results.
+    
+    Args:
+        filename: The remediated file name (e.g., 'media_20260504T083640_d996520e_remediated.mp4')
+    
+    Returns:
+        The remediated media file with appropriate content-type header.
+    """
+    try:
+        # Validate filename to prevent directory traversal
+        if ".." in filename or filename.startswith("/"):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        
+        file_path = RESULTS_DIR / filename
+        
+        # Verify file exists and is within RESULTS_DIR
+        if not file_path.exists() or not file_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Remediated media not found: {filename}")
+        
+        if not str(file_path.resolve()).startswith(str(RESULTS_DIR.resolve())):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        
+        # Determine media type from extension
+        suffix = file_path.suffix.lower()
+        if suffix in [".mp4", ".avi", ".mov", ".webm"]:
+            media_type = "video/mp4" if suffix == ".mp4" else f"video/{suffix[1:]}"
+        elif suffix in [".png", ".jpg", ".jpeg", ".gif", ".webp"]:
+            media_type = f"image/{suffix[1:]}" if suffix != ".jpg" else "image/jpeg"
+        else:
+            media_type = "application/octet-stream"
+        
+        return FileResponse(
+            path=file_path,
+            media_type=media_type,
+            filename=filename
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"⚠️  Error serving remediated media: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving remediated media: {str(e)}")
 
 
 @app.post("/violations/media/jobs", response_model=MediaJobCreateResponse)
@@ -1023,3 +1155,97 @@ async def get_media_violation_job(job_id: str) -> MediaJobStatusResponse:
         errors=job.get("errors", []),
         result=job.get("result"),
     )
+
+
+@app.post("/violations/media/remediate")
+async def remediate_media_endpoint(payload: Dict[str, Any]):
+    """
+    Trigger on-demand remediation for a previously-analyzed media job.
+    Expects JSON: { "job_id": "...", "blur_strength": 51 }
+    """
+    job_id = payload.get("job_id")
+    blur_strength = int(payload.get("blur_strength", BLUR_STRENGTH))
+
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required")
+
+    job = get_media_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Media job not found")
+
+    result = job.get("result")
+    if not result:
+        raise HTTPException(status_code=400, detail="Media job has no result to remediate")
+
+    remediation = result.get("remediation") or {}
+    original_rel = remediation.get("original_path")
+    if not original_rel:
+        raise HTTPException(status_code=400, detail="Original media not available for remediation")
+
+    # Resolve original file path
+    orig_path = (BASE_DIR / Path(original_rel)).resolve()
+    if not orig_path.exists():
+        raise HTTPException(status_code=404, detail="Original media file not found on server")
+
+    media_type = result.get("media_type")
+    frame_analyses = result.get("frame_analyses", [])
+
+    # Prepare remediated output path
+    try:
+        rem_dir = RESULTS_DIR
+        rem_dir.mkdir(parents=True, exist_ok=True)
+        rem_basename = orig_path.stem + "_remediated" + orig_path.suffix
+        rem_path = rem_dir / rem_basename
+
+        update_media_job(job_id, progress=85, stage="remediation-started")
+
+        if media_type == "image":
+            # Compute bboxes from first frame analysis
+            violations = frame_analyses[0].get("violations", []) if frame_analyses else []
+            import cv2
+            img = cv2.imread(str(orig_path))
+            if img is None:
+                raise HTTPException(status_code=500, detail="Failed to read original image for remediation")
+            h, w = img.shape[:2]
+            bboxes = _extract_bboxes_from_violations(violations, w, h)
+            if not bboxes:
+                raise HTTPException(status_code=400, detail="No violation regions to remediate")
+
+            success = remediate_image_file(str(orig_path), str(rem_path), bboxes, blur_strength)
+            if not success:
+                raise HTTPException(status_code=500, detail="Image remediation failed")
+
+            # Update job result
+            result["remediation"]["image_path"] = str((Path("data") / "violation_results" / rem_basename).as_posix())
+            result["remediation"]["enabled"] = True
+            result["remediation"]["stats"] = {"regions_blurred": len(bboxes)}
+
+        else:
+            # Video remediation
+            audio_segments = []
+            remediation_result = remediate_video(
+                input_video_path=str(orig_path),
+                output_video_path=str(rem_path),
+                frame_analyses=frame_analyses,
+                audio_segments=audio_segments,
+                blur_strength=blur_strength,
+                use_beep=USE_BEEP_FOR_AUDIO,
+            )
+
+            if not remediation_result.get("success"):
+                raise HTTPException(status_code=500, detail="Video remediation failed")
+
+            result["remediation"]["video_path"] = str((Path("data") / "violation_results" / rem_basename).as_posix())
+            result["remediation"]["enabled"] = True
+            result["remediation"]["stats"] = remediation_result
+
+        # Persist updated result in memory and update job
+        update_media_job(job_id, result=result, progress=100, stage="remediation-completed", status="completed")
+
+        return {"success": True, "remediation": result.get("remediation")}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        append_media_job_error(job_id, stage="remediation", message=str(e), recoverable=False)
+        raise HTTPException(status_code=500, detail=f"Remediation failed: {e}")

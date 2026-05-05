@@ -26,3 +26,7 @@ decord
 ultralytics
 nudenet
 openai-whisper
+transformers
+better-profanity
+torch
+imageio-ffmpeg

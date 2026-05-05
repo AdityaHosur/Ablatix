@@ -22,5 +22,5 @@ messages = [
     }
 ]
 
-for part in client.chat('qwen3.5:397b-cloud', messages=messages, stream=True):
+for part in client.chat('gemma4:31b-cloud', messages=messages, stream=True):
   print(part.message.content, end='', flush=True)

@@ -12,6 +12,14 @@ import requests
 
 OLLAMA_CHAT_URL = "https://ollama.com/api/chat"
 
+# Resolve ffmpeg executable via imageio-ffmpeg if available, otherwise fall back to system ffmpeg
+try:
+    from imageio_ffmpeg import get_ffmpeg_exe  # type: ignore
+
+    FFMPEG_EXE = get_ffmpeg_exe()
+except Exception:
+    FFMPEG_EXE = "ffmpeg"
+
 _MEDIA_JOBS: Dict[str, Dict[str, Any]] = {}
 _MEDIA_JOBS_LOCK = threading.Lock()
 
@@ -217,7 +225,7 @@ def extract_audio_wav(video_path: str) -> str:
     os.close(fd)
 
     cmd = [
-        "ffmpeg",
+        FFMPEG_EXE,
         "-y",
         "-i",
         video_path,
