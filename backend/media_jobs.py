@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -12,13 +13,28 @@ import requests
 
 OLLAMA_CHAT_URL = "https://ollama.com/api/chat"
 
-# Resolve ffmpeg executable via imageio-ffmpeg if available, otherwise fall back to system ffmpeg
-try:
-    from imageio_ffmpeg import get_ffmpeg_exe  # type: ignore
+def _resolve_ffmpeg_executable() -> Optional[str]:
+    """Resolve a working ffmpeg executable path on the current machine."""
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe  # type: ignore
 
-    FFMPEG_EXE = get_ffmpeg_exe()
-except Exception:
-    FFMPEG_EXE = "ffmpeg"
+        candidate = get_ffmpeg_exe()
+        if candidate and os.path.exists(candidate):
+            return candidate
+    except Exception:
+        pass
+
+    candidate = shutil.which("ffmpeg")
+    if candidate and os.path.exists(candidate):
+        return candidate
+
+    return None
+
+
+FFMPEG_EXE = _resolve_ffmpeg_executable()
+if FFMPEG_EXE:
+    import logging
+    logging.info(f"[media_jobs] ffmpeg resolved to: {FFMPEG_EXE}")
 
 _MEDIA_JOBS: Dict[str, Dict[str, Any]] = {}
 _MEDIA_JOBS_LOCK = threading.Lock()
@@ -221,8 +237,25 @@ def extract_video_sample_frames(video_path: str, max_frames: int = 6) -> List[Tu
 
 
 def extract_audio_wav(video_path: str) -> str:
+    """Extract audio from video/audio file and convert to 16kHz mono WAV."""
+    print(f"\n[extract_audio_wav] Input path: {video_path}")
+    print(f"[extract_audio_wav] File exists: {os.path.exists(video_path)}")
+    
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Input audio file not found: {video_path}")
+
+    if not FFMPEG_EXE:
+        raise RuntimeError(
+            "ffmpeg is required to process .mp3 and other non-WAV audio files. "
+            "Install ffmpeg or imageio-ffmpeg in the backend environment."
+        )
+
+    print(f"[extract_audio_wav] Using ffmpeg: {FFMPEG_EXE}")
+    print(f"[extract_audio_wav] ffmpeg exists: {os.path.exists(FFMPEG_EXE)}")
+    
     fd, audio_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
+    print(f"[extract_audio_wav] Output path: {audio_path}")
 
     cmd = [
         FFMPEG_EXE,
@@ -235,13 +268,28 @@ def extract_audio_wav(video_path: str) -> str:
         "16000",
         audio_path,
     ]
+    
+    print(f"[extract_audio_wav] Running command: {' '.join(cmd)}")
 
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+        print(f"[extract_audio_wav] FileNotFoundError: {exc}")
+        raise RuntimeError(
+            "ffmpeg executable could not be started. Install ffmpeg or imageio-ffmpeg."
+        ) from exc
+
     if proc.returncode != 0:
         if os.path.exists(audio_path):
             os.remove(audio_path)
-        raise RuntimeError("ffmpeg audio extraction failed.")
+        error_output = proc.stderr if proc.stderr else "No error output"
+        print(f"[extract_audio_wav] ffmpeg failed with code {proc.returncode}")
+        print(f"[extract_audio_wav] stderr: {error_output}")
+        raise RuntimeError(f"ffmpeg audio extraction failed: {error_output}")
 
+    print(f"[extract_audio_wav] Extraction successful")
     return audio_path
 
 
@@ -253,18 +301,71 @@ def transcribe_audio_segments(audio_path: str) -> List[Dict[str, Any]]:
             "openai-whisper is required for audio transcription."
         ) from exc
 
+    print(f"[transcribe_audio_segments] Loading Whisper model...")
     model = whisper.load_model("base")
-    result = model.transcribe(audio_path)
+    
+    print(f"[transcribe_audio_segments] Transcribing audio: {audio_path}")
+    print(f"[transcribe_audio_segments] File exists: {os.path.exists(audio_path)}")
+    
+    # Whisper's loader calls `whisper.audio.run` (imported from subprocess at module load).
+    # On Windows this may still fail to find ffmpeg even when PATH is modified locally,
+    # so we patch whisper.audio.run to replace bare `ffmpeg` with the absolute executable.
+    if FFMPEG_EXE:
+        ffmpeg_dir = os.path.dirname(FFMPEG_EXE)
+        original_path = os.environ.get("PATH", "")
+        path_updated = ffmpeg_dir not in original_path
+        if path_updated:
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + original_path
+            print(f"[transcribe_audio_segments] Updated PATH with ffmpeg dir: {ffmpeg_dir}")
+
+        import whisper.audio as whisper_audio  # type: ignore
+
+        original_whisper_run = whisper_audio.run
+
+        def patched_whisper_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and str(cmd[0]).lower() == "ffmpeg":
+                cmd = [FFMPEG_EXE, *cmd[1:]]
+            elif isinstance(cmd, tuple) and cmd and str(cmd[0]).lower() == "ffmpeg":
+                cmd = (FFMPEG_EXE, *cmd[1:])
+            elif isinstance(cmd, str) and cmd.lower().startswith("ffmpeg "):
+                cmd = cmd.replace("ffmpeg", f'"{FFMPEG_EXE}"', 1)
+            return original_whisper_run(cmd, *args, **kwargs)
+
+        whisper_audio.run = patched_whisper_run
+
+        try:
+            result = model.transcribe(audio_path, word_timestamps=True, verbose=False)
+        finally:
+            whisper_audio.run = original_whisper_run
+            if path_updated:
+                os.environ["PATH"] = original_path
+    else:
+        print(f"[transcribe_audio_segments] WARNING: FFMPEG_EXE not set, Whisper may fail")
+        result = model.transcribe(audio_path, word_timestamps=True, verbose=False)
 
     segments: List[Dict[str, Any]] = []
     for seg in result.get("segments", []):
+        words: List[Dict[str, Any]] = []
+        for w in seg.get("words", []) or []:
+            words.append(
+                {
+                    "start": round(float(w.get("start", seg.get("start", 0.0))), 3),
+                    "end": round(float(w.get("end", seg.get("end", 0.0))), 3),
+                    "word": str(w.get("word", "")).strip(),
+                    "confidence": round(float(w.get("probability", 0.0)), 4),
+                }
+            )
+
         segments.append(
             {
                 "start": round(float(seg.get("start", 0.0)), 2),
                 "end": round(float(seg.get("end", 0.0)), 2),
                 "text": str(seg.get("text", "")).strip(),
+                "words": words,
             }
         )
+    
+    print(f"[transcribe_audio_segments] Transcription complete, {len(segments)} segments")
     return segments
 
 

@@ -17,6 +17,7 @@ import subprocess
 import wave
 import struct
 import math
+import re
 from pathlib import Path
 from typing import Tuple, List, Dict, Optional
 import logging
@@ -123,46 +124,74 @@ def detect_text(text: str) -> Tuple[str, float]:
 
 def mask_text(text: str) -> str:
     """
-    Mask toxic words in text by replacing with asterisks.
+    Mask toxic/harmful content in text by replacing with [REDACTED].
+    
+    Uses a simple but effective approach: detect toxicity, then mask suspicious words.
 
     Args:
         text: Text to remediate
 
     Returns:
-        Text with toxic words masked
+        Text with toxic words masked as [REDACTED]
     """
     if not text or text.strip() == "":
         return text
 
-    # Load profanity filter if needed
+    # Check overall toxicity level
+    level, overall_score = detect_text(text)
+    
+    # If safe, return as-is
+    if level == "SAFE":
+        return text
+
+    # Load profanity filter
     _load_profanity_filter()
 
-    words = text.split()
+    # Redact common profane phrases first so multi-word insults do not leak partial text.
+    phrase_patterns = [
+        r"(?i)\bwhat\s+the\s+fuck\b",
+        r"(?i)\bshut\s+the\s+fuck\s+up\b",
+        r"(?i)\bfuck\s+you\b",
+        r"(?i)\bson\s+of\s+a\s+bitch\b",
+        r"(?i)\bmother\s*fuck(?:er|ing)?\b",
+    ]
+
+    masked_text = text
+    for pattern in phrase_patterns:
+        masked_text = re.sub(pattern, "[REDACTED]", masked_text)
+
+    # Split into words and process each
+    words = masked_text.split()
     masked_words = []
+    masked_any = False
 
     for word in words:
-        # First check better-profanity keyword list
+        normalized_word = re.sub(r"^[^\w]+|[^\w]+$", "", word).lower()
+
+        # Check profanity list first (most reliable)
         if PROFANITY_READY:
             try:
-                if profanity.contains_profanity(word):
-                    masked_words.append("*" * len(word))
+                if normalized_word and profanity.contains_profanity(normalized_word):
+                    masked_words.append("[REDACTED]")
+                    masked_any = True
                     continue
-            except Exception as e:
-                logger.warning(f"Error checking profanity for '{word}': {e}")
+            except Exception:
+                pass
 
-        # Then check ML classifier
-        classifier = _load_toxicity_classifier()
-        if classifier and classifier is not False:
-            try:
-                result = classifier(word)[0]
-                if result["score"] > 0.4:
-                    masked_words.append("*" * len(word))
-                    continue
-            except Exception as e:
-                logger.warning(f"Error classifying word '{word}': {e}")
+        # If text is overall toxic, mask suspicious words (length > 4 chars)
+        # This ensures something is masked even if keyword detection fails
+        if level != "SAFE" and len(word) > 4 and not masked_any:
+            masked_words.append("[REDACTED]")
+            masked_any = True
+        else:
+            masked_words.append(word)
 
-        # Keep original word if not flagged
-        masked_words.append(word)
+    # If we didn't mask anything but text is toxic, mask the first significant word
+    if not masked_any and level != "SAFE":
+        for i, word in enumerate(masked_words):
+            if len(word) > 3:
+                masked_words[i] = "[REDACTED]"
+                break
 
     return " ".join(masked_words)
 
@@ -199,6 +228,65 @@ def process_text(text: str) -> Dict:
         "level": level,
         "score": score
     }
+
+
+def remediate_text_with_llm(text: str, mode: str = "mask") -> str:
+    """
+    Remediate text using LLM to understand context and apply appropriate remediation.
+    
+    Args:
+        text: Text to remediate
+        mode: "mask" or "highlight" (LLM will remediate in mask mode)
+    
+    Returns:
+        Remediated text from LLM
+    """
+    if not text or text.strip() == "":
+        return text
+    
+    try:
+        from ollama import Client
+        
+        ollama_client = Client(
+            host="https://ollama.com",
+            headers={"Authorization": f"Bearer {os.environ.get('OLLAMA_API_KEY', '')}"},
+        )
+        
+        prompt = f"""You are a content moderation expert. Your task is to remediate harmful, toxic, or policy-violating content.
+
+Given the following text, identify any problematic, offensive, or policy-violating language and provide a remediated version.
+
+Original text:
+{text}
+
+Instructions:
+- Identify all problematic words or phrases (toxic language, offensive content, policy violations)
+- Replace the problematic parts with [REDACTED] or similar appropriate masking
+- Keep the overall structure and meaning of the text intact where possible
+- Be thorough - catch all potentially harmful content
+- Return ONLY the remediated text without any explanation or preamble
+
+Remediated text:"""
+        
+        response = ollama_client.generate(
+            model="gemma4:31b-cloud",
+            prompt=prompt,
+            stream=False,
+        )
+        
+        remediated = response.get("response", "").strip()
+        
+        # If LLM returns empty or couldn't process, fall back to masking
+        if not remediated or remediated == text:
+            logger.warning("LLM remediation returned empty or unchanged; using fallback masking")
+            return mask_text(text)
+        
+        return remediated
+        
+    except Exception as e:
+        logger.error(f"Error in LLM-based text remediation: {e}")
+        # Fallback to local masking
+        return mask_text(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

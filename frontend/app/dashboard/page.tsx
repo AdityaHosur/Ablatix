@@ -91,13 +91,14 @@ const [file, setFile] = useState<File | null>(null);
 const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 const [isDragging, setIsDragging] = useState(false);
 
-const [mode, setMode] = useState<"image" | "video" | "text">("image");
+const [mode, setMode] = useState<"image" | "video" | "audio" | "text">("image");
 const [textInput, setTextInput] = useState("");
+const [textRemediationMode, setTextRemediationMode] = useState<"mask" | "highlight">("mask");
 
 const [showResults, setShowResults] = useState(false);
 const [isRemediating, setIsRemediating] = useState(false);
 const [isRemediated, setIsRemediated] = useState(false);
-
+const [showRemediatedText, setShowRemediatedText] = useState(false);
 
 const [progress, setProgress] = useState(0);
 
@@ -129,27 +130,27 @@ setList(list.includes(id) ? list.filter(x => x !== id) : [...list, id]);
 };
 
 const handleFile = (uploadedFile: File) => {
-if (
-(mode === "image" && !uploadedFile.type.startsWith("image/")) ||
-(mode === "video" && !uploadedFile.type.startsWith("video/"))
-) {
-alert("Invalid file type selected");
-return;
-}
+  if (
+    (mode === "image" && !uploadedFile.type.startsWith("image/")) ||
+    (mode === "video" && !uploadedFile.type.startsWith("video/")) ||
+    (mode === "audio" && !uploadedFile.type.startsWith("audio/"))
+  ) {
+    alert("Invalid file type selected");
+    return;
+  }
 
+  setFile(uploadedFile);
+  const url = URL.createObjectURL(uploadedFile);
+  setPreviewUrl(url);
 
-setFile(uploadedFile);
-const url = URL.createObjectURL(uploadedFile);
-setPreviewUrl(url);
-
-
-setIsRemediated(false);
-setShowResults(false);
-setProgress(0);
-setMediaAnalysisResult(null);
-setRemediationData(null);
-setRemediationStats(null);
-setLastMediaJobId(null);
+  setIsRemediated(false);
+  setShowRemediatedText(false);
+  setShowResults(false);
+  setProgress(0);
+  setMediaAnalysisResult(null);
+  setRemediationData(null);
+  setRemediationStats(null);
+  setLastMediaJobId(null);
 
 
 };
@@ -157,7 +158,11 @@ setLastMediaJobId(null);
 const handleDownload = async () => {
   if (mode === "text") {
     // For text, we processed it locally, so download the input
-    const blob = new Blob([textInput], { type: "text/plain" });
+    // For text, download remediated or original based on what exists
+    const downloadText = isRemediated && analysisResults ? 
+      (analysisResults[0]?.remediated_text || textInput) : 
+      textInput;
+    const blob = new Blob([downloadText], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -165,9 +170,11 @@ const handleDownload = async () => {
     a.click();
     URL.revokeObjectURL(url);
   } else if (remediationData) {
-    // For image/video, get the actual remediated file from backend
+    // For image/video/audio, get the actual remediated file from backend
     const remediatedPath = mode === "image" 
       ? remediationData.image_path 
+      : mode === "audio"
+      ? remediationData.audio_path
       : remediationData.video_path;
     
     if (!remediatedPath) {
@@ -202,19 +209,57 @@ const handleDownload = async () => {
 };
 
 const handleRemediate = async () => {
-  const jobToRemediate = mediaJobId || lastMediaJobId;
-  if (!jobToRemediate) {
-    alert("No media job available to remediate.");
-    return;
+  // Text mode doesn't need a job ID (remediates directly from text input).
+  // For audio/media, validate that we have either an in-memory job or a persisted result path.
+  if (mode !== "text") {
+    const jobToRemediate = mediaJobId || lastMediaJobId;
+    if (!jobToRemediate) {
+      // If no in-memory job, check for persisted result path
+      const persistedPath = mediaAnalysisResult?.storage_path || mediaAnalysisResult?.result?.storage_path || remediationData?.storage_path || null;
+
+      if (!persistedPath) {
+        alert("No media job available to remediate.");
+        return;
+      }
+    }
   }
 
   setIsRemediating(true);
   try {
-    const res = await fetch("/api/violations/media/remediate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: jobToRemediate }),
-    });
+    let res;
+    if (mode === "text") {
+      res = await fetch("/api/violations/text/remediate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text_input: textInput,
+          mode: textRemediationMode,
+        }),
+      });
+    } else {
+      const jobToRemediate = mediaJobId || lastMediaJobId;
+      if (mode === "audio") {
+        const audioPayload: any = {};
+        if (jobToRemediate) audioPayload.job_id = jobToRemediate;
+        else audioPayload.storage_path = mediaAnalysisResult?.storage_path || mediaAnalysisResult?.result?.storage_path || null;
+
+        res = await fetch("/api/violations/audio/remediate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(audioPayload),
+        });
+      } else {
+        const mediaPayload: any = {};
+        if (jobToRemediate) mediaPayload.job_id = jobToRemediate;
+        else mediaPayload.storage_path = mediaAnalysisResult?.storage_path || mediaAnalysisResult?.result?.storage_path || null;
+
+        res = await fetch("/api/violations/media/remediate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(mediaPayload),
+        });
+      }
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -304,6 +349,52 @@ const getMediaFrameAnalyses = () => {
   return Array.isArray(mediaAnalysisResult?.frame_analyses) ? mediaAnalysisResult.frame_analyses : [];
 };
 
+const runAudioAnalysis = async () => {
+  if (analysisLoading) return;
+  if (!file) return;
+
+  setShowResults(true);
+  setAnalysisLoading(true);
+  setAnalysisError(null);
+  setAnalysisResults(null);
+  setMediaAnalysisResult(null);
+  setMediaJobId(null);
+  setLastMediaJobId(null);
+  setMediaJobStage("queued");
+  setMediaJobProgress(0);
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("description", textInput || "");
+    formData.append("platforms", JSON.stringify(selectedPlatforms));
+    formData.append("countries", JSON.stringify(selectedCountries));
+
+    const res = await fetch("/api/violations/audio", {
+      method: "POST",
+      body: formData,
+    });
+
+    const data = await res.json();
+
+    if (!res.ok || !data.job_id) {
+      setAnalysisError(
+        data?.message || data?.detail || "Failed to start audio analysis job."
+      );
+      setAnalysisLoading(false);
+      return;
+    }
+
+    setMediaJobId(data.job_id);
+    setLastMediaJobId(data.job_id);
+  } catch (err: any) {
+    setAnalysisError(
+      err?.message || "Unable to start audio analysis. Please try again."
+    );
+    setAnalysisLoading(false);
+  }
+};
+
 const runTextAnalysis = async () => {
   if (analysisLoading) return;
   if (!textInput.trim()) return;
@@ -313,6 +404,10 @@ const runTextAnalysis = async () => {
   setAnalysisError(null);
   setAnalysisResults(null);
   setMediaAnalysisResult(null);
+  setIsRemediated(false);
+  setShowRemediatedText(false);
+  setRemediationData(null);
+  setRemediationStats(null);
 
   try {
     const res = await fetch("/api/violations", {
@@ -362,6 +457,10 @@ const runMediaAnalysis = async () => {
   setLastMediaJobId(null);
   setMediaJobStage("queued");
   setMediaJobProgress(0);
+  setIsRemediated(false);
+  setShowRemediatedText(false);
+  setRemediationData(null);
+  setRemediationStats(null);
 
   try {
     const formData = new FormData();
@@ -464,11 +563,30 @@ useEffect(() => {
 }, [mediaJobId]);
 
 // Determine if analysis detected any violations (used to show Remediate button)
-const hasViolations = Boolean(
-  mediaAnalysisResult &&
-  Array.isArray(mediaAnalysisResult.frame_analyses) &&
-  mediaAnalysisResult.frame_analyses.some((f: any) => Array.isArray(f.violations) && f.violations.length > 0)
-);
+const hasViolations = (() => {
+  if (mode === "text") {
+    return Boolean(
+      analysisResults &&
+      Array.isArray(analysisResults) &&
+      analysisResults.some((r: any) => Array.isArray(r.violations) && r.violations.length > 0)
+    );
+  }
+
+  // For media (image/video) and audio jobs, check backend result structures.
+  if (!mediaAnalysisResult) return false;
+
+  // 1) If frame analyses exist (image/video), check their violations.
+  if (Array.isArray(mediaAnalysisResult.frame_analyses) && mediaAnalysisResult.frame_analyses.some((f: any) => Array.isArray(f.violations) && f.violations.length > 0)) {
+    return true;
+  }
+
+  // 2) Otherwise, the backend returns per-document `results` with `violations` (works for audio and for RAG results).
+  if (Array.isArray(mediaAnalysisResult.results) && mediaAnalysisResult.results.some((r: any) => Array.isArray(r.violations) && r.violations.length > 0)) {
+    return true;
+  }
+
+  return false;
+})();
 return ( 
 <div className="min-h-screen bg-slate-50 flex font-[family-name:var(--font-geist-sans)] text-slate-900">
 
@@ -567,6 +685,8 @@ return (
 
       if (mode === "text") {
         await runTextAnalysis();
+      } else if (mode === "audio") {
+        await runAudioAnalysis();
       } else {
         await runMediaAnalysis();
       }
@@ -580,12 +700,13 @@ return (
 </header>
 
       <div className="flex gap-3 mb-6">
-        {["image", "video", "text"].map((m) => (
+        {["image", "video", "audio", "text"].map((m) => (
           <button key={m} onClick={() => {
             setMode(m as any);
             setFile(null);
             setTextInput("");
             setIsRemediated(false);
+            setShowRemediatedText(false);
             setShowResults(false);
             setProgress(0);
             setMediaAnalysisResult(null);
@@ -651,7 +772,7 @@ return (
           )}
 
           <input type="file"
-            accept={mode === "image" ? "image/*" : "video/*"}
+            accept={mode === "image" ? "image/*" : mode === "audio" ? "audio/*" : "video/*"}
             ref={fileInputRef}
             className="hidden"
             onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
@@ -663,7 +784,7 @@ return (
                 <Upload className="text-indigo-600" />
               </div>
               <p className="font-bold text-slate-700">
-                Drag & Drop {mode === "image" ? "Image" : "Video"}
+                Drag & Drop {mode === "image" ? "Image" : mode === "audio" ? "Audio" : "Video"}
               </p>
               <p className="text-slate-400 text-sm mt-1 uppercase tracking-widest font-bold">
                 Click to browse
@@ -958,48 +1079,110 @@ return (
           )}
         </div>
 
-        {remediationData && remediationData.enabled && isRemediated ? (
+        {remediationData && isRemediated ? (
           <div className="mt-4 space-y-3">
-            {/* Remediation Stats */}
-            {remediationStats && (
-              <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 space-y-2">
-                <p className="text-xs font-bold text-emerald-700 uppercase tracking-wide">Remediation Complete ✓</p>
-                {mode === "video" && remediationStats.total_frames && (
-                  <>
-                    <p className="text-[11px] text-slate-600">
-                      <span className="font-semibold">Frames processed:</span> {remediationStats.total_frames} total
-                    </p>
-                    <p className="text-[11px] text-slate-600">
-                      <span className="font-semibold">Violations fixed:</span> {remediationStats.remediated_frames} frames
-                    </p>
-                    {remediationStats.fps && (
+            {/* Text Mode Remediation Display */}
+            {mode === "text" ? (
+              <div className="space-y-3">
+                <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
+                  <p className="text-xs font-bold text-emerald-700 uppercase tracking-wide mb-2">✓ Text Remediated</p>
+                  {showRemediatedText ? (
+                    <>
+                      <p className="text-sm font-semibold text-slate-700 mb-2">Remediated Text:</p>
+                      <div className="p-3 rounded-lg bg-white border border-emerald-200 max-h-60 overflow-y-auto">
+                        <p className="text-sm text-slate-800 whitespace-pre-wrap break-words">
+                          {remediationData.remediated_text || "No remediated text available"}
+                        </p>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="p-3 rounded-lg bg-white border border-emerald-200">
+                      <p className="text-xs text-slate-600">Click below to view the remediated text</p>
+                    </div>
+                  )}
+                </div>
+                
+                {/* Toggle Button to Show/Hide Remediated Text */}
+                <button
+                  onClick={() => setShowRemediatedText(!showRemediatedText)}
+                  className="w-full bg-emerald-600 text-white py-3 rounded-xl font-bold hover:bg-emerald-700 transition-colors"
+                >
+                  {showRemediatedText ? "Hide Remediated Text" : "Show Remediated Text"}
+                </button>
+
+                {/* Download Button */}
+                <button 
+                  onClick={handleDownload} 
+                  className="w-full bg-blue-500 text-white py-3 rounded-xl font-bold hover:bg-blue-600 transition-colors"
+                >
+                  Download Remediated Text
+                </button>
+              </div>
+            ) : (
+              /* Media Mode Remediation Display */
+              <>
+                {/* Remediation Stats */}
+                {remediationStats && (
+                  <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 space-y-2">
+                    <p className="text-xs font-bold text-emerald-700 uppercase tracking-wide">Remediation Complete ✓</p>
+                    {mode === "video" && remediationStats.total_frames && (
+                      <>
+                        <p className="text-[11px] text-slate-600">
+                          <span className="font-semibold">Frames processed:</span> {remediationStats.total_frames} total
+                        </p>
+                        <p className="text-[11px] text-slate-600">
+                          <span className="font-semibold">Violations fixed:</span> {remediationStats.remediated_frames} frames
+                        </p>
+                        {remediationStats.fps && (
+                          <p className="text-[11px] text-slate-600">
+                            <span className="font-semibold">Resolution:</span> {remediationStats.width}x{remediationStats.height} @ {remediationStats.fps}fps
+                          </p>
+                        )}
+                      </>
+                    )}
+                    {mode === "image" && remediationStats.regions_blurred && (
                       <p className="text-[11px] text-slate-600">
-                        <span className="font-semibold">Resolution:</span> {remediationStats.width}x{remediationStats.height} @ {remediationStats.fps}fps
+                        <span className="font-semibold">Regions blurred:</span> {remediationStats.regions_blurred}
                       </p>
                     )}
-                  </>
+                  </div>
                 )}
-                {mode === "image" && remediationStats.regions_blurred && (
-                  <p className="text-[11px] text-slate-600">
-                    <span className="font-semibold">Regions blurred:</span> {remediationStats.regions_blurred}
-                  </p>
-                )}
-              </div>
+                
+                {/* Download Button */}
+                <button 
+                  onClick={handleDownload} 
+                  className="w-full bg-emerald-500 text-white py-3 rounded-xl font-bold hover:bg-emerald-600 transition-colors"
+                >
+                  Download Remediated {mode === "video" ? "Video" : mode === "audio" ? "Audio" : "Image"}
+                </button>
+              </>
             )}
-            
-            {/* Download Button */}
-            <button 
-              onClick={handleDownload} 
-              className="w-full bg-emerald-500 text-white py-3 rounded-xl font-bold hover:bg-emerald-600 transition-colors"
-            >
-              Download Remediated {mode === "text" ? "Text" : mode === "video" ? "Video" : "Image"}
-            </button>
           </div>
         ) : hasViolations ? (
           <div className="mt-4 space-y-3">
             <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
               <p className="font-semibold">Violations detected</p>
               <p className="text-xs mt-1">Click below to run remediation for the detected violations.</p>
+                        {mode === "text" && (
+                          <div className="p-3 rounded-xl bg-purple-50 border border-purple-200">
+                            <p className="text-sm font-semibold text-purple-900 mb-2">Remediation Style</p>
+                            <div className="flex gap-3">
+                              {(["mask", "highlight"] as const).map((m) => (
+                                <button
+                                  key={m}
+                                  onClick={() => setTextRemediationMode(m)}
+                                  className={`flex-1 py-2 px-3 rounded-lg font-semibold text-sm transition-all ${
+                                    textRemediationMode === m
+                                      ? "bg-purple-600 text-white"
+                                      : "bg-white text-purple-600 border border-purple-200 hover:bg-purple-50"
+                                  }`}
+                                >
+                                  {m === "mask" ? "🔒 Mask" : "⭐ Highlight"}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
             </div>
             <button
               onClick={handleRemediate}

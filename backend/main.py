@@ -2,6 +2,7 @@ import os
 import json
 import tempfile
 import uuid
+import re
 from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
@@ -35,6 +36,8 @@ from remediation import (
     remediate_image_file,
     remediate_video,
     remediate_audio_wav,
+    detect_text,
+    mask_text,
 )
 import shutil
 
@@ -55,6 +58,49 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # ─────────────────────────────────────────────
 # Initialize components
 # ─────────────────────────────────────────────
+# Check ffmpeg availability
+from media_jobs import FFMPEG_EXE
+if FFMPEG_EXE:
+    print(f"✓ ffmpeg found at: {FFMPEG_EXE}")
+    # Add ffmpeg binary directory to PATH so that Whisper and other tools can find it by name
+    ffmpeg_dir = os.path.dirname(FFMPEG_EXE)
+    if ffmpeg_dir and ffmpeg_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        print(f"✓ Added ffmpeg directory to PATH: {ffmpeg_dir}")
+
+    # Ensure a plain 'ffmpeg' executable is discoverable by subprocess calls that use the bare name.
+    # Some libraries (whisper) call 'ffmpeg' directly and may not respect the imageio-ffmpeg full path.
+    try:
+        import sys
+        venv_scripts = os.path.join(os.path.dirname(sys.executable), "Scripts")
+        target_ffmpeg = os.path.join(venv_scripts, "ffmpeg.exe")
+        if not shutil.which("ffmpeg") and not os.path.exists(target_ffmpeg):
+            try:
+                # Ensure Scripts directory exists
+                os.makedirs(venv_scripts, exist_ok=True)
+                # If we can't copy the binary, write a small wrapper batch file that calls the imageio-ffmpeg binary.
+                if os.path.exists(FFMPEG_EXE):
+                    try:
+                        shutil.copy2(FFMPEG_EXE, target_ffmpeg)
+                        print(f"✓ Copied ffmpeg binary to venv Scripts: {target_ffmpeg}")
+                    except Exception as copy_err:
+                        try:
+                            # Fallback: create ffmpeg.bat wrapper
+                            wrapper_path = os.path.join(venv_scripts, "ffmpeg.bat")
+                            with open(wrapper_path, "w", encoding="utf-8") as f:
+                                f.write(f'@echo off\n"{FFMPEG_EXE}" %*\n')
+                            print(f"✓ Wrote ffmpeg wrapper to venv Scripts: {wrapper_path}")
+                        except Exception as wrap_err:
+                            print(f"⚠️  Could not create ffmpeg wrapper: {wrap_err}")
+                else:
+                    print(f"⚠️  Expected ffmpeg binary not found at: {FFMPEG_EXE}")
+            except Exception as e:
+                print(f"⚠️  Could not ensure venv Scripts or install ffmpeg: {e}")
+    except Exception:
+        pass
+else:
+    print("⚠️  ffmpeg not found. Audio (.mp3, .m4a, etc.) processing will fail. Install ffmpeg or imageio-ffmpeg.")
+
 print("Loading PageIndex service...")
 try:
     page_index_service = PageIndexService(api_key=os.environ.get("PAGEINDEX_API_KEY"))
@@ -1169,13 +1215,36 @@ async def remediate_media_endpoint(payload: Dict[str, Any]):
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id is required")
 
-    job = get_media_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Media job not found")
+    job = None
+    result = None
+    if job_id:
+        job = get_media_job(job_id)
+        if not job:
+            job = None
+        else:
+            result = job.get("result")
 
-    result = job.get("result")
+    # If no in-memory job/result, allow remediation via persisted storage_path
     if not result:
-        raise HTTPException(status_code=400, detail="Media job has no result to remediate")
+        storage_path = payload.get("storage_path") or payload.get("result_storage_path")
+        if storage_path:
+            try:
+                storage_file = Path(storage_path)
+                if not storage_file.exists():
+                    storage_file = (BASE_DIR / storage_path).resolve()
+
+                if not storage_file.exists():
+                    raise HTTPException(status_code=404, detail="Persisted analysis result not found")
+
+                raw = json.loads(storage_file.read_text(encoding="utf-8"))
+                result = raw
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to load persisted result: {e}")
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Media job not found")
 
     remediation = result.get("remediation") or {}
     original_rel = remediation.get("original_path")
@@ -1240,7 +1309,9 @@ async def remediate_media_endpoint(payload: Dict[str, Any]):
             result["remediation"]["stats"] = remediation_result
 
         # Persist updated result in memory and update job
-        update_media_job(job_id, result=result, progress=100, stage="remediation-completed", status="completed")
+        # Persist updated result back to in-memory job if available
+        if job:
+            update_media_job(job_id, result=result, progress=100, stage="remediation-completed", status="completed")
 
         return {"success": True, "remediation": result.get("remediation")}
 
@@ -1249,3 +1320,618 @@ async def remediate_media_endpoint(payload: Dict[str, Any]):
     except Exception as e:
         append_media_job_error(job_id, stage="remediation", message=str(e), recoverable=False)
         raise HTTPException(status_code=500, detail=f"Remediation failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# AUDIO REMEDIATION ENDPOINTS
+# ─────────────────────────────────────────────
+
+@app.post("/violations/audio/jobs", response_model=MediaJobCreateResponse)
+async def create_audio_violation_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    description: str = Form(""),
+    platforms: str = Form("[]"),
+    countries: str = Form("[]"),
+    top_n_for_llm: int = Form(3),
+) -> MediaJobCreateResponse:
+    """Create an audio analysis job for violation detection."""
+    # Validate audio format
+    valid_audio_formats = {".wav", ".mp3", ".m4a", ".ogg", ".aac", ".flac"}
+    file_ext = os.path.splitext(file.filename or "")[1].lower()
+    if file_ext not in valid_audio_formats:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported audio format. Supported: {', '.join(valid_audio_formats)}"
+        )
+
+    try:
+        parsed_platforms = json.loads(platforms) if platforms else []
+        parsed_countries = json.loads(countries) if countries else []
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON for platforms/countries: {e}")
+
+    if not isinstance(parsed_platforms, list) or not isinstance(parsed_countries, list):
+        raise HTTPException(status_code=400, detail="platforms and countries must be JSON arrays.")
+
+    docs = _resolve_docs_by_selection(parsed_platforms, parsed_countries)
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail="No matching guideline documents found for selected platforms/regions.",
+        )
+
+    suffix = os.path.splitext(file.filename or "upload.wav")[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    job = create_media_job(
+        {
+            "media_type": "audio",
+            "description": description,
+            "platforms": parsed_platforms,
+            "countries": parsed_countries,
+            "top_n_for_llm": top_n_for_llm,
+            "filename": file.filename,
+        }
+    )
+
+    background_tasks.add_task(
+        _process_audio_job,
+        job["job_id"],
+        tmp_path,
+        description,
+        docs,
+        top_n_for_llm,
+    )
+
+    return MediaJobCreateResponse(job_id=job["job_id"], status=job["status"])
+
+
+def _process_audio_job(
+    job_id: str,
+    audio_path: str,
+    user_description: str,
+    docs: List[ViolationDocDescriptor],
+    top_n_for_llm: int,
+) -> None:
+    """Process audio file for violation detection."""
+    print(f"\n[_process_audio_job] Starting job {job_id}")
+    print(f"[_process_audio_job] Audio path: {audio_path}")
+    print(f"[_process_audio_job] File exists: {os.path.exists(audio_path)}")
+    if os.path.exists(audio_path):
+        print(f"[_process_audio_job] File size: {os.path.getsize(audio_path)} bytes")
+    
+    update_media_job(job_id, status="processing", stage="audio-analysis", progress=10)
+    
+    transcript_segments: List[Dict[str, Any]] = []
+    
+    try:
+        # Convert audio to WAV 16kHz mono if needed
+        wav_path = None
+        try:
+            # Verify the uploaded file exists
+            if not os.path.exists(audio_path):
+                raise FileNotFoundError(f"Uploaded audio file not found at: {audio_path}")
+            
+            file_ext = os.path.splitext(audio_path)[1].lower()
+            print(f"[_process_audio_job] File extension: {file_ext}")
+            
+            if file_ext != ".wav":
+                print(f"[_process_audio_job] Converting {file_ext} to WAV...")
+                try:
+                    wav_path = extract_audio_wav(audio_path)
+                    print(f"[_process_audio_job] Conversion successful, WAV path: {wav_path}")
+                except (OSError, FileNotFoundError) as fe:
+                    # Handle ffmpeg issues - WinError 2, missing exe, etc.
+                    print(f"[_process_audio_job] Conversion failed: {fe}")
+                    raise RuntimeError(
+                        f"Failed to convert {file_ext} audio to WAV. "
+                        f"This usually means ffmpeg is not installed. "
+                        f"Install ffmpeg or imageio-ffmpeg and try again. Details: {fe}"
+                    ) from fe
+            else:
+                wav_path = audio_path
+                print(f"[_process_audio_job] File is already WAV, using as-is")
+            
+            update_media_job(job_id, progress=30, stage="audio-transcription")
+            
+            # Transcribe audio
+            print(f"[_process_audio_job] Transcribing audio...")
+            transcript_segments = transcribe_audio_segments(wav_path)
+            print(f"[_process_audio_job] Transcription complete, {len(transcript_segments)} segments")
+            update_media_job(job_id, progress=60, stage="audio-analysis-complete")
+            
+        except Exception as e:
+            print(f"[_process_audio_job] Error during conversion/transcription: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            error_msg = str(e)
+            if "ffmpeg" in error_msg.lower() or "WinError 2" in str(e):
+                error_msg = f"Audio processing failed. ffmpeg may not be installed. {error_msg}"
+            
+            append_media_job_error(
+                job_id,
+                stage="audio-transcription",
+                message=error_msg,
+                recoverable=False,
+            )
+            raise
+        finally:
+            # Clean up temp WAV if we created one
+            if wav_path and wav_path != audio_path and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except:
+                    pass
+        
+        # Create description from transcript
+        transcript_text = " ".join([seg.get("text", "") for seg in transcript_segments])
+        synthesized_description = user_description.strip()
+        if transcript_text.strip():
+            if synthesized_description:
+                synthesized_description += f"\n\nAudio transcript: {transcript_text[:1000]}"
+            else:
+                synthesized_description = f"Audio transcript: {transcript_text}"
+        
+        update_media_job(job_id, progress=75, stage="guideline-reasoning")
+        
+        # Run violation query against guidelines
+        violations = _run_violation_query(
+            description=synthesized_description,
+            docs=docs,
+            top_n_for_llm=top_n_for_llm,
+        )
+        
+        # Persist original audio for on-demand remediation
+        try:
+            originals_dir = RESULTS_DIR / "audio_originals"
+            originals_dir.mkdir(parents=True, exist_ok=True)
+            orig_basename = f"{job_id}_{os.path.basename(audio_path)}"
+            orig_dest = originals_dir / orig_basename
+            shutil.copy(audio_path, orig_dest)
+            original_rel = str((Path("data") / "violation_results" / "audio_originals" / orig_basename).as_posix())
+        except Exception as e:
+            print(f"⚠️  Failed to persist original audio: {e}")
+            original_rel = None
+        
+        result_payload = {
+            "kind": "audio",
+            "created_at": _utc_now_iso(),
+            "media_type": "audio",
+            "description": synthesized_description,
+            "audio_transcription": transcript_segments,
+            "selected_docs": [doc.model_dump() for doc in docs],
+            "results": [r.model_dump() for r in violations.results],
+            "remediation": {
+                "enabled": False,
+                "original_path": original_rel,
+                "audio_path": None,
+                "stats": {},
+            }
+        }
+        
+        storage_path = _persist_violation_result("audio", result_payload)
+        result_payload["storage_path"] = storage_path
+        
+        update_media_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            progress=100,
+            result=result_payload,
+        )
+    
+    except Exception as e:
+        append_media_job_error(job_id, stage="fatal", message=str(e), recoverable=False)
+        update_media_job(job_id, status="failed", stage="fatal", progress=0)
+
+
+def _extract_violation_terms(violation_results: List[Dict[str, Any]]) -> List[str]:
+    """Extract searchable violation terms from guideline results."""
+    stop_words = {
+        "the", "and", "for", "with", "that", "this", "from", "have", "has", "not",
+        "are", "was", "were", "you", "your", "they", "their", "about", "into", "over",
+        "content", "policy", "guideline", "guidelines", "violation", "violations", "media",
+        "audio", "text", "speech", "illegal", "harmful", "includes", "include", "using",
+    }
+    terms: List[str] = []
+
+    for doc_result in violation_results or []:
+        candidate_texts: List[str] = []
+        if isinstance(doc_result.get("answer"), str):
+            candidate_texts.append(doc_result.get("answer", ""))
+
+        for violation in doc_result.get("violations", []) or []:
+            for key in ("type", "category", "description", "snippet", "text", "reason"):
+                value = violation.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidate_texts.append(value)
+
+        for blob in candidate_texts:
+            for token in re.findall(r"[a-zA-Z']{3,}", blob.lower()):
+                cleaned = token.strip("'")
+                if cleaned and cleaned not in stop_words:
+                    terms.append(cleaned)
+
+    # Keep unique, stable order.
+    deduped: List[str] = []
+    seen = set()
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
+
+
+def _segment_words_with_timestamps(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return word items with timestamps; interpolate if model output has no words."""
+    words = seg.get("words") or []
+    if isinstance(words, list) and words:
+        out: List[Dict[str, Any]] = []
+        for w in words:
+            start = float(w.get("start", seg.get("start", 0.0)))
+            end = float(w.get("end", seg.get("end", start)))
+            word = str(w.get("word", "")).strip()
+            if not word:
+                continue
+            out.append({"start": start, "end": max(end, start), "word": word})
+        if out:
+            return out
+
+    # Fallback: interpolate word timing across segment range.
+    seg_text = str(seg.get("text", "")).strip()
+    tokens = re.findall(r"\S+", seg_text)
+    if not tokens:
+        return []
+
+    seg_start = float(seg.get("start", 0.0))
+    seg_end = float(seg.get("end", seg_start))
+    duration = max(seg_end - seg_start, 0.0)
+    step = duration / len(tokens) if tokens else 0.0
+    out: List[Dict[str, Any]] = []
+    for idx, tok in enumerate(tokens):
+        start = seg_start + idx * step
+        end = seg_start + (idx + 1) * step if idx < len(tokens) - 1 else seg_end
+        out.append({"start": start, "end": max(end, start), "word": tok})
+    return out
+
+
+def _merge_spans(spans: List[Dict[str, float]], max_gap_sec: float = 0.08) -> List[Dict[str, float]]:
+    if not spans:
+        return []
+
+    ordered = sorted(spans, key=lambda s: (float(s["start"]), float(s["end"])))
+    merged: List[Dict[str, float]] = [ordered[0].copy()]
+
+    for span in ordered[1:]:
+        current = merged[-1]
+        if float(span["start"]) <= float(current["end"]) + max_gap_sec:
+            current["end"] = max(float(current["end"]), float(span["end"]))
+        else:
+            merged.append(span.copy())
+
+    return [{"start": round(float(s["start"]), 3), "end": round(float(s["end"]), 3)} for s in merged]
+
+
+def _map_violation_spans_from_transcript(
+    transcript_segments: List[Dict[str, Any]],
+    violation_results: List[Dict[str, Any]],
+) -> List[Dict[str, float]]:
+    """
+    Build precise timestamp spans for beeping.
+    Priority:
+    1) Match words against extracted policy-violation terms.
+    2) Toxicity fallback at segment level (never whole-file fallback).
+    """
+    if not transcript_segments:
+        return []
+
+    violation_terms = set(_extract_violation_terms(violation_results))
+    spans: List[Dict[str, float]] = []
+
+    for seg in transcript_segments:
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", seg_start))
+        seg_text = str(seg.get("text", "")).strip()
+
+        words = _segment_words_with_timestamps(seg)
+        for w in words:
+            cleaned = re.sub(r"[^a-zA-Z']", "", str(w.get("word", "")).lower()).strip("'")
+            if cleaned and cleaned in violation_terms:
+                spans.append({
+                    "start": float(w.get("start", seg_start)),
+                    "end": float(w.get("end", seg_start)),
+                })
+
+        # Toxic segment fallback when policy matching cannot localize words.
+        level, _score = detect_text(seg_text)
+        if level in {"MEDIUM", "HIGH"}:
+            spans.append({"start": seg_start, "end": seg_end})
+
+    return _merge_spans(spans)
+
+
+@app.post("/violations/audio/remediate")
+async def remediate_audio_endpoint(payload: Dict[str, Any]):
+    """
+    Trigger on-demand remediation for a previously-analyzed audio job.
+    Beep remediation is always used for detected violating timestamps.
+    """
+    job_id = payload.get("job_id")
+    mode = payload.get("mode", "beep")
+
+    storage_path = payload.get("storage_path") or payload.get("result_storage_path")
+    if not job_id and not storage_path:
+        raise HTTPException(status_code=400, detail="job_id or storage_path is required")
+
+    if mode != "beep":
+        # Backward-compatible input handling: mode is accepted but remediation remains beep-only.
+        print(f"⚠️  Audio remediation mode '{mode}' requested; using beep-only remediation")
+
+    job = None
+    result = None
+    if job_id:
+        job = get_media_job(job_id)
+        if job:
+            result = job.get("result")
+
+    # If no in-memory job/result, allow remediation via a persisted storage_path
+    if not result:
+        if storage_path:
+            try:
+                # storage_path may be absolute or relative; try both
+                storage_file = Path(storage_path)
+                if not storage_file.exists():
+                    # try relative to BASE_DIR
+                    storage_file = (BASE_DIR / storage_path).resolve()
+
+                if not storage_file.exists():
+                    raise HTTPException(status_code=404, detail="Persisted analysis result not found")
+
+                raw = json.loads(storage_file.read_text(encoding="utf-8"))
+                result = raw
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to load persisted result: {e}")
+
+    if not result:
+        raise HTTPException(status_code=400, detail="Audio job has no result to remediate")
+
+    remediation = result.get("remediation") or {}
+    original_rel = remediation.get("original_path")
+    if not original_rel:
+        raise HTTPException(status_code=400, detail="Original audio not available for remediation")
+
+    # Resolve original file path
+    orig_path = (BASE_DIR / Path(original_rel)).resolve()
+    if not orig_path.exists():
+        raise HTTPException(status_code=404, detail="Original audio file not found on server")
+
+    transcript_segments = result.get("audio_transcription", [])
+    violation_results = result.get("results", [])
+
+    try:
+        rem_dir = RESULTS_DIR / "audio_remediated"
+        rem_dir.mkdir(parents=True, exist_ok=True)
+        rem_basename = orig_path.stem + "_remediated" + orig_path.suffix
+        rem_path = rem_dir / rem_basename
+
+        # Convert audio to WAV for processing
+        wav_path = None
+        try:
+            if orig_path.suffix.lower() != ".wav":
+                wav_path = extract_audio_wav(str(orig_path))
+            else:
+                wav_path = str(orig_path)
+
+            if job_id and job:
+                update_media_job(job_id, progress=50, stage="audio-remediation")
+
+            # Identify precise violating timestamps (word-level when available).
+            flagged_segments = _map_violation_spans_from_transcript(
+                transcript_segments=transcript_segments,
+                violation_results=violation_results,
+            )
+
+            if not flagged_segments:
+                # No violations were detected at all, nothing to remediate
+                raise HTTPException(status_code=400, detail="No violations found to remediate")
+
+            # Apply beep remediation only.
+            success = remediate_audio_wav(
+                original_audio=wav_path,
+                flagged_segments=flagged_segments,
+                output_audio=str(rem_path),
+                use_beep=True,
+            )
+
+            if not success:
+                raise HTTPException(status_code=500, detail="Audio remediation failed")
+
+            result["remediation"]["audio_path"] = str(
+                (Path("data") / "violation_results" / "audio_remediated" / rem_basename).as_posix()
+            )
+            result["remediation"]["enabled"] = True
+            total_beep_duration = sum(max(0.0, float(s.get("end", 0.0)) - float(s.get("start", 0.0))) for s in flagged_segments)
+            result["remediation"]["stats"] = {
+                "segments_remediated": len(flagged_segments),
+                "mode": "beep",
+                "mapping_method": "word_timestamps+toxicity",
+                "total_beep_duration_sec": round(total_beep_duration, 3),
+            }
+
+            # Persist changes back to in-memory job if available, otherwise just return remediation info
+            if job_id and job:
+                update_media_job(job_id, result=result, progress=100, stage="remediation-completed", status="completed")
+
+            return {"success": True, "remediation": result.get("remediation")}
+
+        finally:
+            # Clean up temp WAV
+            if wav_path and wav_path != str(orig_path) and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except:
+                    pass
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        append_media_job_error(job_id, stage="remediation", message=str(e), recoverable=False)
+        raise HTTPException(status_code=500, detail=f"Audio remediation failed: {e}")
+
+
+@app.get("/violations/audio/remediated/{filename}")
+async def get_remediated_audio(filename: str):
+    """
+    Serve remediated audio files from violation results.
+    
+    Args:
+        filename: The remediated file name (e.g., 'audio_20260504T083640_d996520e_remediated.wav')
+    
+    Returns:
+        The remediated audio file with appropriate content-type header.
+    """
+    try:
+        # Validate filename to prevent directory traversal
+        if ".." in filename or filename.startswith("/"):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        
+        file_path = RESULTS_DIR / "audio_remediated" / filename
+        
+        # Verify file exists and is within RESULTS_DIR
+        if not file_path.exists() or not file_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Remediated audio not found: {filename}")
+        
+        if not str(file_path.resolve()).startswith(str(RESULTS_DIR.resolve())):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        
+        # Determine audio type from extension
+        suffix = file_path.suffix.lower()
+        audio_types = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+        }
+        media_type = audio_types.get(suffix, "audio/wav")
+        
+        return FileResponse(
+            path=file_path,
+            media_type=media_type,
+            filename=filename
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"⚠️  Error serving remediated audio: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving remediated audio: {str(e)}")
+
+
+# ─────────────────────────────────────────────
+# TEXT REMEDIATION ENDPOINTS
+# ─────────────────────────────────────────────
+
+class TextAnalysisRequest(BaseModel):
+    text_input: str
+    platforms: List[str] = Field(default_factory=list)
+    countries: List[str] = Field(default_factory=list)
+    description: str = ""
+    top_n_for_llm: int = 3
+
+
+class TextRemediationRequest(BaseModel):
+    text_input: str
+    mode: str = "mask"  # "mask" or "highlight"
+
+
+class TextAnalysisResponse(BaseModel):
+    success: bool = True
+    violations: List[Dict[str, Any]] = Field(default_factory=list)
+    original_text: str
+    policy_references: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class TextRemediationResponse(BaseModel):
+    success: bool = True
+    original_text: str
+    remediated_text: str
+    violations: List[Dict[str, Any]] = Field(default_factory=list)
+    mode: str
+
+
+@app.post("/violations/text/analyze", response_model=TextAnalysisResponse)
+async def analyze_text_endpoint(request: TextAnalysisRequest):
+    """Analyze text input for policy violations."""
+    if not request.text_input or not request.text_input.strip():
+        raise HTTPException(status_code=400, detail="text_input cannot be empty")
+
+    # Resolve documents
+    docs = _resolve_docs_by_selection(request.platforms, request.countries)
+    if not docs:
+        docs = _resolve_docs_by_selection([], [])  # Use default docs if none selected
+    
+    if not docs:
+        raise HTTPException(status_code=400, detail="No guideline documents available")
+
+    try:
+        # Run violation query
+        violations = _run_violation_query(
+            description=request.text_input,
+            docs=docs,
+            top_n_for_llm=request.top_n_for_llm,
+        )
+        
+        return TextAnalysisResponse(
+            success=True,
+            violations=[v.model_dump() for v in violations.results],
+            original_text=request.text_input,
+            policy_references=[doc.model_dump() for doc in docs],
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text analysis failed: {e}")
+
+
+@app.post("/violations/text/remediate")
+async def remediate_text_endpoint(request: TextRemediationRequest):
+    """Remediate text by masking violations."""
+    if not request.text_input or not request.text_input.strip():
+        raise HTTPException(status_code=400, detail="text_input cannot be empty")
+
+    if request.mode not in ["mask", "highlight"]:
+        raise HTTPException(status_code=400, detail="mode must be 'mask' or 'highlight'")
+
+    try:
+        # Detect toxicity level
+        level, score = detect_text(request.text_input)
+        
+        if request.mode == "mask":
+            # Use masking to remediate the text
+            remediated = mask_text(request.text_input)
+            violations = [{"type": "toxicity", "level": level, "score": score}] if level != "SAFE" else []
+        else:  # highlight mode
+            remediated = request.text_input  # Keep original, client will highlight
+            violations = [{"type": "toxicity", "level": level, "score": score}] if level != "SAFE" else []
+        
+        remediation_obj = {
+            "original_text": request.text_input,
+            "remediated_text": remediated,
+            "violations": violations,
+            "mode": request.mode,
+            "stats": {}
+        }
+        
+        return {
+            "success": True,
+            "remediation": remediation_obj
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text remediation failed: {e}")

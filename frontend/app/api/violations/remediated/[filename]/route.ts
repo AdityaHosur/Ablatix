@@ -16,14 +16,22 @@ export async function GET(
       );
     }
 
+    // Determine if this is audio or media based on filename
+    const isAudio = filename.includes("audio") || 
+                    [".wav", ".mp3", ".m4a", ".ogg", ".aac", ".flac"].some(ext => filename.endsWith(ext));
+    
+    const backendEndpoint = isAudio 
+      ? `/violations/audio/remediated/${filename}`
+      : `/violations/media/remediated/${filename}`;
+
     const res = await fetch(
-      `${BACKEND_URL}/violations/media/remediated/${filename}`,
+      `${BACKEND_URL}${backendEndpoint}`,
       { method: "GET" }
     );
 
     if (!res.ok) {
       return NextResponse.json(
-        { success: false, message: `Failed to fetch remediated media: ${res.statusText}` },
+        { success: false, message: `Failed to fetch remediated file: ${res.statusText}` },
         { status: res.status }
       );
     }
@@ -41,7 +49,7 @@ export async function GET(
     });
   } catch (err: any) {
     return NextResponse.json(
-      { success: false, message: err?.message || "Unexpected error while downloading remediated media" },
+      { success: false, message: err?.message || "Unexpected error while downloading remediated file" },
       { status: 500 }
     );
   }
