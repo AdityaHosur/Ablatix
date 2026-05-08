@@ -87,12 +87,12 @@ class TestTextRemediation:
         assert result["original"] == "Have a nice day"
 
     def test_remediate_text_endpoint_masks_and_normalizes(self, monkeypatch):
-        """The text remediation endpoint should return normalized masked text for mask mode."""
+        """The text remediation endpoint should return normalized LLM-redacted text for mask mode."""
         monkeypatch.setattr(backend_main, "detect_text", lambda text: ("HIGH", 0.94))
         monkeypatch.setattr(
             backend_main,
-            "mask_text",
-            lambda text: "I ***** you",
+            "remediate_text_with_llm",
+            lambda text, mode="mask": "I [REDACTED] you",
         )
 
         request = backend_main.TextRemediationRequest(text_input="I hate you", mode="mask")

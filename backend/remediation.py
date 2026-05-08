@@ -258,16 +258,19 @@ def process_text(text: str) -> Dict:
 
 def remediate_text_with_llm(text: str, mode: str = "mask") -> str:
     """
-    Remediate text using LLM to understand context and apply appropriate remediation.
+    Remediate text using an LLM to rewrite or redact offending spans in context.
     
     Args:
         text: Text to remediate
-        mode: "mask" or "highlight" (LLM will remediate in mask mode)
+        mode: "mask" or "highlight" (mask mode performs contextual redaction)
     
     Returns:
-        Remediated text from LLM
+        Remediated text from LLM, or a local fallback when the model fails
     """
     if not text or text.strip() == "":
+        return text
+
+    if mode != "mask":
         return text
     
     try:
@@ -278,7 +281,7 @@ def remediate_text_with_llm(text: str, mode: str = "mask") -> str:
             headers={"Authorization": f"Bearer {os.environ.get('OLLAMA_API_KEY', '')}"},
         )
         
-        prompt = f"""You are a content moderation expert. Your task is to remediate harmful, toxic, or policy-violating content.
+        prompt = f"""You are a content moderation expert. Rewrite the text below so that any harmful, toxic, offensive, or policy-violating spans are replaced with [REDACTED].
 
 Given the following text, identify any problematic, offensive, or policy-violating language and provide a remediated version.
 
@@ -286,11 +289,10 @@ Original text:
 {text}
 
 Instructions:
-- Identify all problematic words or phrases (toxic language, offensive content, policy violations)
-- Replace the problematic parts with [REDACTED] or similar appropriate masking
-- Keep the overall structure and meaning of the text intact where possible
-- Be thorough - catch all potentially harmful content
-- Return ONLY the remediated text without any explanation or preamble
+    - Preserve all non-sensitive words exactly as written.
+    - Replace only the offending spans; do not paraphrase or rewrite the rest of the sentence.
+    - Keep punctuation and spacing as close to the original as possible.
+    - Return ONLY the rewritten text.
 
 Remediated text:"""
         
@@ -301,8 +303,12 @@ Remediated text:"""
         )
         
         remediated = response.get("response", "").strip()
+        remediated = remediated.strip("`\"' ")
+        remediated = re.sub(r"^Remediated text:\s*", "", remediated, flags=re.IGNORECASE)
+        remediated = re.sub(r"\[REDACTED\]", "[REDACTED]", remediated, flags=re.IGNORECASE)
+        remediated = re.sub(r"\*{5,}", "[REDACTED]", remediated)
         
-        # If LLM returns empty or couldn't process, fall back to masking
+        # If the LLM returns empty or effectively unchanged text, fall back to masking.
         if not remediated or remediated == text:
             logger.warning("LLM remediation returned empty or unchanged; using fallback masking")
             return mask_text(text)

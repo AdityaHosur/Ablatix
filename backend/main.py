@@ -38,6 +38,7 @@ from remediation import (
     remediate_audio_wav,
     detect_text,
     mask_text,
+    remediate_text_with_llm,
 )
 import shutil
 
@@ -1923,8 +1924,8 @@ async def remediate_text_endpoint(request: TextRemediationRequest):
         level, score = detect_text(request.text_input)
         
         if request.mode == "mask":
-            # Use deterministic masking, then normalize the output token.
-            remediated = _normalize_text_redactions(mask_text(request.text_input))
+            # Use the LLM to rewrite only offending spans, then normalize the output token.
+            remediated = _normalize_text_redactions(remediate_text_with_llm(request.text_input, mode="mask"))
             violations = [{"type": "toxicity", "level": level, "score": score}] if level != "SAFE" else []
         else:  # highlight mode
             remediated = request.text_input  # Keep original, client will highlight
