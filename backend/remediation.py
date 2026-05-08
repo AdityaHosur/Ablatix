@@ -8,7 +8,11 @@ Provides functions to detect and remediate harmful content:
 - Audio: mute or beep harmful speech segments
 """
 
-import cv2
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 import numpy as np
 import os
 import json
@@ -140,12 +144,14 @@ def mask_text(text: str) -> str:
     # Check overall toxicity level
     level, overall_score = detect_text(text)
     
-    # If safe, return as-is
-    if level == "SAFE":
-        return text
+    # NOTE: don't early-return on SAFE — still attempt profanity/fallback masking
+    # because the toxicity classifier may be unavailable or miss isolated profane tokens.
 
     # Load profanity filter
     _load_profanity_filter()
+
+    # Use a consistent masking token for UI: five asterisks
+    MASK_TOKEN = "*****"
 
     # Redact common profane phrases first so multi-word insults do not leak partial text.
     phrase_patterns = [
@@ -158,42 +164,62 @@ def mask_text(text: str) -> str:
 
     masked_text = text
     for pattern in phrase_patterns:
-        masked_text = re.sub(pattern, "[REDACTED]", masked_text)
+        masked_text = re.sub(pattern, MASK_TOKEN, masked_text)
 
-    # Split into words and process each
-    words = masked_text.split()
-    masked_words = []
-    masked_any = False
+    # Fallback profanity and abuse word list (covers common words when better_profanity not installed)
+    fallback_bad_words = [
+        r"fuck",
+        r"shit",
+        r"bitch",
+        r"asshole",
+        r"cunt",
+        r"motherfuck(?:er|ing)?",
+        r"dick",
+        r"piss",
+        r"bastard",
+        r"hate",
+        r"stupid",
+        r"idiot",
+        r"dumb",
+        r"moron",
+        r"loser",
+        r"trash",
+        r"garbage",
+        r"worthless",
+        r"pathetic",
+    ]
 
-    for word in words:
-        normalized_word = re.sub(r"^[^\w]+|[^\w]+$", "", word).lower()
+    # If the profanity library is available, use it to censor exact tokens; otherwise use fallback list
+    if PROFANITY_READY:
+        try:
+            # `profanity.censor` typically replaces profane words with asterisks
+            censored = profanity.censor(masked_text)
+            # Normalize consecutive asterisks into our MASK_TOKEN
+            censored = re.sub(r"\*{2,}", MASK_TOKEN, censored)
+            # If censorship changed the text, return that
+            if censored != masked_text:
+                return censored
+        except Exception:
+            pass
 
-        # Check profanity list first (most reliable)
-        if PROFANITY_READY:
-            try:
-                if normalized_word and profanity.contains_profanity(normalized_word):
-                    masked_words.append("[REDACTED]")
-                    masked_any = True
-                    continue
-            except Exception:
-                pass
+    # Manual per-word masking as a fallback
+    def mask_word_match(m: re.Match) -> str:
+        return MASK_TOKEN
 
-        # If text is overall toxic, mask suspicious words (length > 4 chars)
-        # This ensures something is masked even if keyword detection fails
-        if level != "SAFE" and len(word) > 4 and not masked_any:
-            masked_words.append("[REDACTED]")
-            masked_any = True
-        else:
-            masked_words.append(word)
+    # Build a single regex that matches whole-word occurrences of bad words
+    fallback_pattern = r"(?i)\b(?:" + r"|".join(fallback_bad_words) + r")\b"
+    masked_after_fallback = re.sub(fallback_pattern, mask_word_match, masked_text)
 
-    # If we didn't mask anything but text is toxic, mask the first significant word
-    if not masked_any and level != "SAFE":
-        for i, word in enumerate(masked_words):
-            if len(word) > 3:
-                masked_words[i] = "[REDACTED]"
+    # If detect_text already flagged toxicity but nothing matched above, mask the first significant token
+    if masked_after_fallback == masked_text and level != "SAFE":
+        words = masked_text.split()
+        for i, w in enumerate(words):
+            if len(re.sub(r"[^\w]", "", w)) > 3:
+                words[i] = MASK_TOKEN
                 break
+        return " ".join(words)
 
-    return " ".join(masked_words)
+    return masked_after_fallback
 
 
 def process_text(text: str) -> Dict:

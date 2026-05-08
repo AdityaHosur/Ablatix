@@ -44,6 +44,38 @@ interface ViolationsBackendResponse {
   results: ViolationDocResult[];
 }
 
+async function runViolationQueryForDoc(
+  description: string,
+  doc: ViolationDocDescriptor
+): Promise<ViolationDocResult> {
+  const response = await fetch(`${BACKEND_URL}/violations/query`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      description,
+      docs: [doc],
+      top_n_for_llm: 3,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Violation analysis failed (${response.status}): ${text}`);
+  }
+
+  const payload = (await response.json()) as ViolationsBackendResponse;
+  return payload.results?.[0] || {
+    doc_id: doc.doc_id,
+    label: doc.label || null,
+    answer: "",
+    sources: [],
+    reasoning: "",
+    violations: [],
+  };
+}
+
 function normaliseCountryName(name: string): string {
   return name.trim().toLowerCase().replace(/\s+/g, "_");
 }
@@ -237,36 +269,19 @@ export async function POST(req: Request) {
       );
     }
 
-    // 4) Call backend violations/query
-    const violationsRes = await fetch(`${BACKEND_URL}/violations/query`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        description,
-        docs,
-        top_n_for_llm: 3,
-      }),
-    });
-
-    if (!violationsRes.ok) {
-      const text = await violationsRes.text();
-      return NextResponse.json(
-        {
-          success: false,
-          message: `Violation analysis failed (${violationsRes.status}): ${text}`,
-        },
-        { status: 502 }
-      );
+    // 4) Call backend violations/query sequentially for each guideline document.
+    const results: ViolationDocResult[] = [];
+    for (const doc of docs) {
+      const result = await runViolationQueryForDoc(description, doc);
+      results.push(result);
     }
-
-    const violationsJson = (await violationsRes.json()) as ViolationsBackendResponse;
 
     return NextResponse.json({
       success: true,
-      description: violationsJson.description,
-      results: violationsJson.results,
+      description,
+      analysis_mode: "sequential",
+      docs_checked: docs.length,
+      results,
     });
   } catch (err: any) {
     return NextResponse.json(

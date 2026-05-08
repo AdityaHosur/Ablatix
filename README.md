@@ -92,6 +92,77 @@ These categories are derived from real-world platform policies and represent the
 - Dheer N Raijada (1MS22CS167)
 - Manvith A Rai (1MS23CS407)
 
+---
+
+## Build Steps
+
+Follow these steps to build and run the project locally.
+
+**Backend:**
+- Create and activate a Python virtual environment and install requirements:
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r backend/requirements.txt
+```
+
+- Run the backend (from the repository root or inside `backend`):
+
+```powershell
+cd backend
+uvicorn main:app --reload
+```
+
+**Frontend:**
+- Install dependencies and build the frontend:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+- Run frontend in development mode:
+
+```bash
+npm run dev
+```
+
+Notes: On Windows prefer the PowerShell commands shown; on macOS/Linux use the corresponding shell variants.
+
+## Environment variables
+
+Add required API keys and runtime flags to the backend and frontend environment files. Do NOT commit secrets to source control.
+
+- **Backend (.env)**: create `backend/.env` with the following keys (example):
+
+```env
+PAGEINDEX_API_KEY="<your_pageindex_api_key>"
+OLLAMA_API_KEY="<your_ollama_api_key>"
+GROQ_API_KEY="<your_groq_api_key>"    # optional, if using Groq
+GEMINI_API_KEY="<your_gemini_api_key>" # optional, Google/Gemini
+OLLAMA_MODEL="gemma4:31b-cloud"       # optional override
+ENABLE_REMEDIATION=true                # true/false
+BLUR_STRENGTH=51                       # integer (gaussian kernel size)
+USE_BEEP_FOR_AUDIO=true                # true/false
+```
+
+See an example `.env` already present at [backend/.env](backend/.env#L1-L4).
+
+- **Frontend (.env.local)**: for Next.js create `frontend/.env.local` (or use your deployment's env settings):
+
+```env
+NEXT_PUBLIC_BACKEND_URL="http://localhost:8000"  # URL reachable from the browser
+BACKEND_URL="http://127.0.0.1:8000"              # used by server-side/frontend proxies
+```
+
+Notes:
+- Use `NEXT_PUBLIC_` prefixed variables for values that must be available in the browser.
+- Keep API keys and secrets in the backend only; do not expose them as `NEXT_PUBLIC_` values.
+- Add `.env`/`.env.local` to `.gitignore` if not already ignored.
+
+
 
 
 

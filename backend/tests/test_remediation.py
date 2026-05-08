@@ -7,6 +7,7 @@ Tests text, image, and audio remediation functions.
 import pytest
 import os
 import tempfile
+import asyncio
 import numpy as np
 import cv2
 import wave
@@ -29,6 +30,8 @@ from remediation import (
     remediate_media,
     remediate_frame,
 )
+
+import main as backend_main
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +68,16 @@ class TestTextRemediation:
         assert masked is not None
         assert len(masked) > 0
 
+    def test_mask_text_redacts_common_abuse_when_detector_is_safe(self, monkeypatch):
+        """Common abusive terms should still be masked even if the detector is unavailable or SAFE."""
+        monkeypatch.setattr("remediation.detect_text", lambda text: ("SAFE", 0.0))
+
+        original = "I hate you"
+        masked = mask_text(original)
+
+        assert masked != original
+        assert "*****" in masked
+
     def test_process_text_returns_dict(self):
         """Test that process_text returns proper dict."""
         result = process_text("Have a nice day")
@@ -72,6 +85,23 @@ class TestTextRemediation:
         assert "remediated" in result
         assert "level" in result
         assert result["original"] == "Have a nice day"
+
+    def test_remediate_text_endpoint_masks_and_normalizes(self, monkeypatch):
+        """The text remediation endpoint should return normalized masked text for mask mode."""
+        monkeypatch.setattr(backend_main, "detect_text", lambda text: ("HIGH", 0.94))
+        monkeypatch.setattr(
+            backend_main,
+            "mask_text",
+            lambda text: "I ***** you",
+        )
+
+        request = backend_main.TextRemediationRequest(text_input="I hate you", mode="mask")
+        response = asyncio.run(backend_main.remediate_text_endpoint(request))
+
+        assert response["success"] is True
+        assert response["remediation"]["original_text"] == "I hate you"
+        assert response["remediation"]["remediated_text"] == "I ****** you"
+        assert response["remediation"]["mode"] == "mask"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

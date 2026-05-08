@@ -1866,6 +1866,16 @@ class TextRemediationResponse(BaseModel):
     mode: str
 
 
+def _normalize_text_redactions(text: str) -> str:
+    """Normalize any redaction token into the dashboard's six-asterisk format."""
+    if not text:
+        return text
+
+    text = re.sub(r"\[REDACTED\]", "******", text, flags=re.IGNORECASE)
+    text = re.sub(r"\*{5,}", "******", text)
+    return text
+
+
 @app.post("/violations/text/analyze", response_model=TextAnalysisResponse)
 async def analyze_text_endpoint(request: TextAnalysisRequest):
     """Analyze text input for policy violations."""
@@ -1913,8 +1923,8 @@ async def remediate_text_endpoint(request: TextRemediationRequest):
         level, score = detect_text(request.text_input)
         
         if request.mode == "mask":
-            # Use masking to remediate the text
-            remediated = mask_text(request.text_input)
+            # Use deterministic masking, then normalize the output token.
+            remediated = _normalize_text_redactions(mask_text(request.text_input))
             violations = [{"type": "toxicity", "level": level, "score": score}] if level != "SAFE" else []
         else:  # highlight mode
             remediated = request.text_input  # Keep original, client will highlight
