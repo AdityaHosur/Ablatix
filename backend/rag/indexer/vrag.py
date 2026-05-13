@@ -170,6 +170,7 @@ Return strict JSON only:
     if not context_parts:
         raise ValueError("Selected nodes do not contain text. Re-index with node text enabled.")
 
+    joined_context = "\n\n".join(context_parts)
     answer_prompt = f"""
 Answer the question using only the provided context.
 If context is insufficient, say you do not have enough information.
@@ -177,7 +178,7 @@ If context is insufficient, say you do not have enough information.
 Question: {query}
 
 Context:
-{'\n\n'.join(context_parts)}
+{joined_context}
 """
 
     answer = _call_llm(

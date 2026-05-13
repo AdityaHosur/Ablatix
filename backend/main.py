@@ -922,6 +922,7 @@ def _process_media_job(
                 api_key=ollama_api_key,
                 prompt=(
                     "Analyze this image for policy and safety compliance violations.\n\n"
+                    "Explicitly detect and flag visual violations such as violence, nudity, weapons, cigarette smoking, tobacco products, alcohol bottles/cans, and people drinking alcohol.\n\n"
                     "Return ONLY valid JSON:\n"
                     "{\n"
                     '  "violations": [\n'
@@ -956,6 +957,7 @@ def _process_media_job(
                     api_key=ollama_api_key,
                     prompt=(
                         "Analyze this video frame for policy and safety compliance violations.\n\n"
+                        "Explicitly detect and flag visual violations such as violence, nudity, weapons, cigarette smoking, tobacco products, alcohol bottles/cans, and people drinking alcohol.\n\n"
                         "Return ONLY valid JSON:\n"
                         "{\n"
                         '  "violations": [\n'
